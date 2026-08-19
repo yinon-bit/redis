@@ -1170,7 +1170,7 @@ void srandmemberWithCountCommand(client *c) {
             /* Specialized case for listpack, traversing it only once. */
             unsigned long limit, sample_count;
             limit = count > SRANDFIELD_RANDOM_SAMPLE_LIMIT ? SRANDFIELD_RANDOM_SAMPLE_LIMIT : count;
-            listpackEntry *entries = zmalloc(limit * sizeof(listpackEntry));
+            listpackEntry *entries = zmalloc_scratch(limit * sizeof(listpackEntry));
             while (count) {
                 sample_count = count > limit ? limit : count;
                 count -= sample_count;
@@ -1398,7 +1398,7 @@ int qsortCompareSetsByRevCardinality(const void *s1, const void *s2) {
 void sinterGenericCommand(client *c, robj **setkeys,
                           unsigned long setnum, robj *dstkey,
                           int cardinality_only, unsigned long limit) {
-    setopsrc *sets = zmalloc(sizeof(setopsrc)*setnum);
+    setopsrc *sets = zmalloc_scratch(sizeof(setopsrc)*setnum);
     setTypeIterator si;
     robj *dstset = NULL;
     char *str;
@@ -1655,7 +1655,7 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
      * non-storing UNION that returns a count. */
     serverAssert(!approx || (op == SET_OP_UNION && cardinality_only && dstkey == NULL));
 
-    setopsrc *sets = zmalloc(sizeof(setopsrc)*setnum);
+    setopsrc *sets = zmalloc_scratch(sizeof(setopsrc)*setnum);
     setTypeIterator si;
     robj *dstset = NULL;
     robj *hllobj = NULL; /* Used only for approximate (HLL) cardinality. */

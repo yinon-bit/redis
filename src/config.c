@@ -2379,6 +2379,20 @@ static int isValidActiveDefrag(int val, const char **err) {
     return 1;
 }
 
+static int isValidScratchArena(int val, const char **err) {
+#ifndef USE_JEMALLOC
+    if (val) {
+        *err = "scratch-arena cannot be enabled: it requires "
+               "a Redis server compiled with jemalloc support";
+        return 0;
+    }
+#else
+    UNUSED(val);
+    UNUSED(err);
+#endif
+    return 1;
+}
+
 static int isValidDBfilename(char *val, const char **err) {
     if (!pathIsBaseName(val)) {
         *err = "dbfilename can't be a path, just a filename";
@@ -3214,6 +3228,7 @@ standardConfig static_configs[] = {
     createBoolConfig("replica-ignore-maxmemory", "slave-ignore-maxmemory", MODIFIABLE_CONFIG, server.repl_slave_ignore_maxmemory, 1, NULL, NULL),
     createBoolConfig("jemalloc-bg-thread", NULL, MODIFIABLE_CONFIG, server.jemalloc_bg_thread, 1, NULL, updateJemallocBgThread),
     createBoolConfig("activedefrag", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.active_defrag_enabled, 0, isValidActiveDefrag, NULL),
+    createBoolConfig("scratch-arena", NULL, DEBUG_CONFIG | IMMUTABLE_CONFIG, server.scratch_arena_enabled, 1, isValidScratchArena, NULL), /* Tag short-lived, never-keyspace allocations (SORT's temp vector, client reply blocks, query buffers when safe) with a dedicated jemalloc arena to reduce fragmentation of the main arena. Requires jemalloc. */
     createBoolConfig("syslog-enabled", NULL, IMMUTABLE_CONFIG, server.syslog_enabled, 0, NULL, NULL),
     createBoolConfig("cluster-enabled", NULL, IMMUTABLE_CONFIG, server.cluster_enabled, 0, NULL, NULL),
     createBoolConfig("appendonly", NULL, MODIFIABLE_CONFIG, server.aof_enabled, 0, NULL, updateAppendonly),

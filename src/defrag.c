@@ -1240,6 +1240,18 @@ float getAllocatorFragmentation(size_t *out_frag_bytes) {
         frag_smallbins_bytes -= lua_frag_smallbins_bytes;
     }
 
+    if (server.scratch_arena != UINT_MAX) {
+        /* Same reasoning as the Lua arena above: the scratch arena only ever holds
+         * short-lived, non-keyspace command buffers (see sortCommand's temp vector),
+         * so it's safe to exclude it here too. */
+        size_t s_resident, s_active, s_allocated, s_frag_smallbins_bytes;
+        zmalloc_get_allocator_info_by_arena(server.scratch_arena, 0, &s_allocated, &s_active, &s_resident, &s_frag_smallbins_bytes);
+        resident -= s_resident;
+        active -= s_active;
+        allocated -= s_allocated;
+        frag_smallbins_bytes -= s_frag_smallbins_bytes;
+    }
+
     /* Calculate the fragmentation ratio as the proportion of wasted memory in small
      * bins (which are defraggable) relative to the total allocated memory (including large bins).
      * This is because otherwise, if most of the memory usage is large bins, we may show high percentage,

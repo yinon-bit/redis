@@ -347,6 +347,77 @@ sds sdsMakeRoomForNonGreedy(sds s, size_t addlen) {
     return _sdsMakeRoomFor(s, addlen, 0);
 }
 
+#if defined(USE_JEMALLOC)
+/* Same as _sdsMakeRoomFor(), but allocates via mallocx()/rallocx() with the
+ * given jemalloc flags (e.g. MALLOCX_ARENA(...)) instead of the plain
+ * s_malloc_usable()/s_realloc_usable() macros. This is a separate function
+ * rather than a 'flags' parameter threaded into _sdsMakeRoomFor() so that the
+ * hot, unflagged path used by every other sds string in the codebase is
+ * completely unaffected. See querybufMakeRoomFor() in networking.c for the
+ * only current caller. */
+static sds _sdsMakeRoomForWithFlags(sds s, size_t addlen, int greedy, int flags) {
+    void *sh, *newsh;
+    size_t avail = sdsavail(s);
+    size_t len, newlen, reqlen;
+    char type, oldtype = sdsType(s);
+    int hdrlen;
+    size_t bufsize, usable;
+    int use_realloc;
+
+    if (avail >= addlen) return s;
+
+    len = sdslen(s);
+    sh = (char*)s-sdsHdrSize(oldtype);
+    reqlen = newlen = (len+addlen);
+    assert(newlen > len);
+    if (greedy == 1) {
+        if (newlen < SDS_MAX_PREALLOC)
+            newlen *= 2;
+        else
+            newlen += SDS_MAX_PREALLOC;
+    }
+
+    type = sdsReqType(newlen);
+    if (type == SDS_TYPE_5) type = SDS_TYPE_8;
+
+    hdrlen = sdsHdrSize(type);
+    assert(hdrlen + newlen + 1 > reqlen);
+    use_realloc = (oldtype == type);
+    if (use_realloc) {
+        newsh = zrealloc_usable_with_flags(sh, hdrlen + newlen + 1, flags, &bufsize);
+        if (newsh == NULL) return NULL;
+        s = (char*)newsh + hdrlen;
+        if (adjustTypeIfNeeded(&type, &hdrlen, bufsize)) {
+            memmove((char *)newsh + hdrlen, s, len + 1);
+            s = (char *)newsh + hdrlen;
+            s[-1] = type;
+            sdssetlen(s, len);
+        }
+    } else {
+        newsh = zmalloc_usable_with_flags(hdrlen + newlen + 1, flags, &bufsize);
+        if (newsh == NULL) return NULL;
+        adjustTypeIfNeeded(&type, &hdrlen, bufsize);
+        memcpy((char*)newsh+hdrlen, s, len+1);
+        zfree_with_flags(sh, flags);
+        s = (char*)newsh+hdrlen;
+        s[-1] = type;
+        sdssetlen(s, len);
+    }
+    usable = bufsize - hdrlen - 1;
+    assert(type == SDS_TYPE_5 || usable <= sdsTypeMaxSize(type));
+    sdssetalloc(s, usable);
+    return s;
+}
+
+sds sdsMakeRoomForWithFlags(sds s, size_t addlen, int flags) {
+    return _sdsMakeRoomForWithFlags(s, addlen, 1, flags);
+}
+
+sds sdsMakeRoomForNonGreedyWithFlags(sds s, size_t addlen, int flags) {
+    return _sdsMakeRoomForWithFlags(s, addlen, 0, flags);
+}
+#endif
+
 /* Reallocate the sds string so that it has no free space at the end. The
  * contained string remains not altered, but next concatenation operations
  * will require a reallocation.

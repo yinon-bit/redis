@@ -75,10 +75,54 @@ size_t getStringObjectLen(robj *o) {
 }
 
 /* Client.reply list dup and free methods. */
+#if defined(USE_JEMALLOC)
+/* clientReplyBlock/querybuf allocations are short-lived, non-keyspace, bursty
+ * scratch memory for whichever thread owns a given client, so tagging them
+ * with the shared scratch jemalloc arena (see scratchArenaInit() in
+ * server.c) is safe for the same reason SORT's temp vector is: they're
+ * always freed by the same code path that allocated them and never become a
+ * stored keyspace value.
+ *
+ * Unlike SORT's vector though, ANY thread that owns a client (the main
+ * thread, or an IO thread) can hit these call sites. Forcing all of them
+ * into one shared arena is only safe when there's no other thread that could
+ * also be routing allocations into that same arena: with IO threads active,
+ * centralizing every thread's per-client buffer traffic into a single arena
+ * would create exactly the kind of cross-thread arena contention we don't
+ * want to introduce. Returns 0 (jemalloc's default/automatic arena
+ * assignment) whenever that's not provably safe -- i.e. whenever there's
+ * more than one thread (main thread + IO threads) that could allocate here. */
+static inline int scratchArenaFlagsForClientBuffers(void) {
+    if (server.scratch_arena != UINT_MAX && !server.io_threads_active)
+        return MALLOCX_ARENA(server.scratch_arena);
+    return 0;
+}
+
+/* c->querybuf growth wrapper: same scratch-arena reasoning as
+ * scratchArenaFlagsForClientBuffers() above. */
+static inline sds querybufMakeRoomFor(sds s, size_t addlen, int greedy) {
+    int flags = scratchArenaFlagsForClientBuffers();
+    if (flags) {
+        return greedy ? sdsMakeRoomForWithFlags(s, addlen, flags)
+                       : sdsMakeRoomForNonGreedyWithFlags(s, addlen, flags);
+    }
+    return greedy ? sdsMakeRoomFor(s, addlen) : sdsMakeRoomForNonGreedy(s, addlen);
+}
+#else
+static inline sds querybufMakeRoomFor(sds s, size_t addlen, int greedy) {
+    return greedy ? sdsMakeRoomFor(s, addlen) : sdsMakeRoomForNonGreedy(s, addlen);
+}
+#endif
+
 void *dupClientReplyValue(void *o) {
     clientReplyBlock *old = o;
-    clientReplyBlock *buf = zmalloc(sizeof(clientReplyBlock) + old->size);
-    memcpy(buf, o, sizeof(clientReplyBlock) + old->size);
+    size_t size = sizeof(clientReplyBlock) + old->size;
+#if defined(USE_JEMALLOC)
+    clientReplyBlock *buf = zmalloc_with_flags(size, scratchArenaFlagsForClientBuffers());
+#else
+    clientReplyBlock *buf = zmalloc(size);
+#endif
+    memcpy(buf, o, size);
     return buf;
 }
 
@@ -430,7 +474,12 @@ static void _addReplyPayloadToList(client *c, list *reply_list, const char *payl
         size_t usable_size;
         size_t required_size = encoded ? len + sizeof(payloadHeader) : len;
         size_t size = required_size < PROTO_REPLY_CHUNK_BYTES ? PROTO_REPLY_CHUNK_BYTES : required_size;
+#if defined(USE_JEMALLOC)
+        tail = zmalloc_usable_with_flags(size + sizeof(clientReplyBlock),
+                                         scratchArenaFlagsForClientBuffers(), &usable_size);
+#else
         tail = zmalloc_usable(size + sizeof(clientReplyBlock), &usable_size);
+#endif
         /* take over the allocation's internal fragmentation */
         tail->size = usable_size - sizeof(clientReplyBlock);
         tail->used = 0;
@@ -891,7 +940,12 @@ void trimReplyUnusedTailSpace(client *c) {
     {
         size_t usable_size;
         size_t old_size = tail->size;
+#if defined(USE_JEMALLOC)
+        tail = zrealloc_usable_with_flags(tail, tail->used + sizeof(clientReplyBlock),
+                                          scratchArenaFlagsForClientBuffers(), &usable_size);
+#else
         tail = zrealloc_usable(tail, tail->used + sizeof(clientReplyBlock), &usable_size, NULL);
+#endif
         /* take over the allocation's internal fragmentation (at least for
          * memory usage tracking) */
         tail->size = usable_size - sizeof(clientReplyBlock);
@@ -978,7 +1032,12 @@ void setDeferredReply(client *c, void *node, const char *s, size_t length) {
     } else {
         /* Create a new node */
         size_t usable_size;
+#if defined(USE_JEMALLOC)
+        clientReplyBlock *buf = zmalloc_usable_with_flags(length + sizeof(clientReplyBlock),
+                                                          scratchArenaFlagsForClientBuffers(), &usable_size);
+#else
         clientReplyBlock *buf = zmalloc_usable(length + sizeof(clientReplyBlock), &usable_size);
+#endif
         /* Take over the allocation's internal fragmentation */
         buf->size = usable_size - sizeof(clientReplyBlock);
         buf->used = length;
@@ -3353,7 +3412,7 @@ static int processMultibulkBuffer(client *c, pendingCommand *pcmd) {
                     c->qb_pos = 0;
                     /* Hint the sds library about the amount of bytes this string is
                      * going to contain. */
-                    c->querybuf = sdsMakeRoomForNonGreedy(c->querybuf,ll+2-querybuf_len);
+                    c->querybuf = querybufMakeRoomFor(c->querybuf,ll+2-querybuf_len, 0);
                     /* We later set the peak to the used portion of the buffer, but here we over
                      * allocated because we know what we need, make sure it'll not be shrunk before used. */
                     if (c->querybuf_peak < (size_t)ll + 2) c->querybuf_peak = ll + 2;
@@ -3904,12 +3963,12 @@ void readQueryFromClient(connection *conn) {
          * need, so using the non-greedy growing. For an initial allocation of
          * the query buffer, we also don't wanna use the greedy growth, in order
          * to avoid collision with the RESIZE_THRESHOLD mechanism. */
-        c->querybuf = sdsMakeRoomForNonGreedy(c->querybuf, readlen);
+        c->querybuf = querybufMakeRoomFor(c->querybuf, readlen, 0);
         /* We later set the peak to the used portion of the buffer, but here we over
          * allocated because we know what we need, make sure it'll not be shrunk before used. */
         if (c->querybuf_peak < qblen + readlen) c->querybuf_peak = qblen + readlen;
     } else {
-        c->querybuf = sdsMakeRoomFor(c->querybuf, readlen);
+        c->querybuf = querybufMakeRoomFor(c->querybuf, readlen, 1);
 
         /* Read as much as possible from the socket to save read(2) system calls. */
         readlen = sdsavail(c->querybuf);
@@ -5364,6 +5423,7 @@ int closeClientOnOutputBufferLimitReached(client *c, int async) {
      * (they use the global repl buffers). */
     if ((c->reply_bytes == 0 && c->reply_bytes_shared == 0 && !clientTypeIsSlave(c)) ||
         c->flags & CLIENT_CLOSE_ASAP) return 0;
+
     if (checkClientOutputBufferLimits(c)) {
         sds client = catClientInfoString(sdsempty(),c);
 

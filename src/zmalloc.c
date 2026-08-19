@@ -351,6 +351,33 @@ void zfree_with_flags(void *ptr, int flags) {
     update_zmalloc_stat_free(zmalloc_size(ptr));
     dallocx(ptr, flags);
 }
+
+/* Same as zmalloc_with_flags()/zrealloc_with_flags(), but also report back the
+ * allocation's actual usable size, mirroring zmalloc_usable()/zrealloc_usable().
+ * Used by callers (e.g. sds's WithFlags variants) that need to take advantage
+ * of the allocator's internal fragmentation the same way the plain "_usable"
+ * functions already do. */
+void *zmalloc_usable_with_flags(size_t size, int flags, size_t *usable) {
+    void *ptr = zmalloc_with_flags(size, flags);
+    if (usable) *usable = zmalloc_size(ptr);
+    return ptr;
+}
+
+void *zrealloc_usable_with_flags(void *ptr, size_t size, int flags, size_t *usable) {
+    void *newptr = zrealloc_with_flags(ptr, size, flags);
+    if (usable) *usable = newptr ? zmalloc_size(newptr) : 0;
+    return newptr;
+}
+
+/* Like ztrymalloc(), but with jemalloc flags (e.g. MALLOCX_ARENA). Returns
+ * NULL on OOM instead of invoking the OOM handler. */
+void *ztrymalloc_with_flags(size_t size, int flags) {
+    if (size >= SIZE_MAX/2) return NULL;
+    void *ptr = mallocx(size+PREFIX_SIZE, flags);
+    if (!ptr) return NULL;
+    update_zmalloc_stat_alloc(zmalloc_size(ptr));
+    return ptr;
+}
 #endif
 
 /* Allocation and free functions that bypass the thread cache

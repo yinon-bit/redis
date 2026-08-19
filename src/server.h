@@ -1914,6 +1914,10 @@ struct malloc_stats {
     size_t lua_allocator_active;
     size_t lua_allocator_resident;
     size_t lua_allocator_frag_smallbins_bytes;
+    size_t scratch_allocator_allocated;
+    size_t scratch_allocator_active;
+    size_t scratch_allocator_resident;
+    size_t scratch_allocator_frag_smallbins_bytes;
 };
 
 /* Tick-local cache used by computeDefragCycles() to avoid duplicating the
@@ -2573,6 +2577,15 @@ struct redisServer {
     int cluster_slot_stats_enabled; /* Cluster slot usage statistics tracking enabled. */
     /* Scripting */
     unsigned int lua_arena;         /* eval lua arena used in jemalloc. */
+    unsigned int scratch_arena;     /* Dedicated jemalloc arena for short-lived, non-keyspace
+                                     * command scratch allocations (e.g. SORT's temp vector,
+                                     * and -- only when io_threads_active is false -- client
+                                     * reply blocks/query buffers), kept separate from
+                                     * long-lived key data so it doesn't skew fragmentation
+                                     * stats or interleave with key pages.
+                                     * UINT_MAX if unavailable/not jemalloc/disabled. */
+    int scratch_arena_enabled;      /* Config: create/use the scratch arena above at all.
+                                     * Requires jemalloc. Default on. */
     mstime_t busy_reply_threshold;  /* Script / module timeout in milliseconds */
     int pre_command_oom_state;         /* OOM before command (script?) was started */
     int script_disable_deny_script;    /* Allow running commands marked "noscript" inside a script. */
@@ -3108,6 +3121,76 @@ typedef struct {
 
 extern struct redisServer server;
 extern struct sharedObjectsStruct shared;
+
+/*-----------------------------------------------------------------------------
+ * Scratch-arena helpers (short-lived, never-keyspace command temps)
+ *
+ * Use only for buffers freed on the same command/request path that never
+ * become keyspace values (SORT vectors, setop tables, geoArray, etc.).
+ * Client I/O buffers use scratchArenaFlagsForClientBuffers() in networking.c
+ * instead, which is gated on !io_threads_active.
+ *
+ * Only allocations of at least SCRATCH_ARENA_MIN_SIZE are routed to the scratch
+ * arena. Small command temps (e.g. BITOP's per-key pointer arrays, a handful of
+ * ZADD scores) are served from the thread's regular arena and its thread cache,
+ * which is both hotter and cheaper than reaching into a second, rarely touched
+ * arena. They're also too small to be what interleaves with long-lived key
+ * pages in the first place, so isolating them costs cycles without buying any
+ * fragmentation benefit. The threshold matches PROTO_REPLY_CHUNK_BYTES, which
+ * is also roughly where jemalloc switches from small bins to extent-backed
+ * large allocations -- exactly the ones that can leave unreclaimable holes. */
+#define SCRATCH_ARENA_MIN_SIZE PROTO_REPLY_CHUNK_BYTES
+
+static inline int useScratchArenaFor(size_t size) {
+#if defined(USE_JEMALLOC)
+    return server.scratch_arena != UINT_MAX && size >= SCRATCH_ARENA_MIN_SIZE;
+#else
+    UNUSED(size);
+    return 0;
+#endif
+}
+
+static inline void *zmalloc_scratch(size_t size) {
+#if defined(USE_JEMALLOC)
+    if (useScratchArenaFor(size))
+        return zmalloc_with_flags(size, MALLOCX_ARENA(server.scratch_arena));
+#endif
+    return zmalloc(size);
+}
+
+static inline void *zcalloc_scratch(size_t size) {
+#if defined(USE_JEMALLOC)
+    if (useScratchArenaFor(size)) {
+        void *ptr = zmalloc_with_flags(size, MALLOCX_ARENA(server.scratch_arena));
+        if (ptr) memset(ptr, 0, size);
+        return ptr;
+    }
+#endif
+    return zcalloc(size);
+}
+
+static inline void *ztrycalloc_scratch(size_t size) {
+#if defined(USE_JEMALLOC)
+    if (useScratchArenaFor(size)) {
+        void *ptr = ztrymalloc_with_flags(size, MALLOCX_ARENA(server.scratch_arena));
+        if (ptr) memset(ptr, 0, size);
+        return ptr;
+    }
+#endif
+    return ztrycalloc(size);
+}
+
+/* Note: when a buffer grows across the threshold, rallocx() may either expand
+ * in place inside the original arena or move it into the scratch arena. Both
+ * are correct; the arena flag is only a hint for the new allocation. */
+static inline void *zrealloc_scratch(void *ptr, size_t size) {
+#if defined(USE_JEMALLOC)
+    if (useScratchArenaFor(size))
+        return zrealloc_with_flags(ptr, size, MALLOCX_ARENA(server.scratch_arena));
+#endif
+    return zrealloc(ptr, size);
+}
+
 extern dictType objectKeyPointerValueDictType;
 extern dictType objectKeyNoValueDictType;
 extern dictType objectKeyHeapPointerValueDictType;

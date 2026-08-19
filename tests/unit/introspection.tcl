@@ -643,6 +643,7 @@ start_server {tags {"introspection"}} {
             syslog-facility
             databases
             io-threads
+            scratch-arena
             logfile
             unixsocketperm
             replicaof
