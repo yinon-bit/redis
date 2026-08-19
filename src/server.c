@@ -1508,11 +1508,19 @@ void cronUpdateMemoryStats(void) {
                                                 &server.cron_malloc_stats.lua_allocator_resident,
                                                 &server.cron_malloc_stats.lua_allocator_frag_smallbins_bytes);
         }
-        /* Publish the just-measured (Lua-arena-subtracted) fragmentation
+        if (server.scratch_arena != UINT_MAX) {
+            zmalloc_get_allocator_info_by_arena(server.scratch_arena,
+                                                0,
+                                                &server.cron_malloc_stats.scratch_allocator_allocated,
+                                                &server.cron_malloc_stats.scratch_allocator_active,
+                                                &server.cron_malloc_stats.scratch_allocator_resident,
+                                                &server.cron_malloc_stats.scratch_allocator_frag_smallbins_bytes);
+        }
+        /* Publish the just-measured (Lua/scratch-arena-subtracted) fragmentation
          * values into the defrag-side tick-local cache so
          * computeDefragCycles() later this tick can skip its own
          * duplicate jemalloc measurement. Mirrors
-         * getAllocatorFragmentation()'s Lua subtraction so the cached
+         * getAllocatorFragmentation()'s Lua/scratch subtraction so the cached
          * value matches the fall-through real measurement exactly.
          * Publishing with allocated==0 leaves the cache invalid
          * (sentinel set inside the publish) — defrag should decide on
@@ -1522,6 +1530,10 @@ void cronUpdateMemoryStats(void) {
         if (alloc > 0 && server.lua_arena != UINT_MAX) {
             frag  -= server.cron_malloc_stats.lua_allocator_frag_smallbins_bytes;
             alloc -= server.cron_malloc_stats.lua_allocator_allocated;
+        }
+        if (alloc > 0 && server.scratch_arena != UINT_MAX) {
+            frag  -= server.cron_malloc_stats.scratch_allocator_frag_smallbins_bytes;
+            alloc -= server.cron_malloc_stats.scratch_allocator_allocated;
         }
         defragFragCachePut(frag, alloc);
         /* in case the allocator isn't providing these stats, fake them so that
@@ -2966,6 +2978,34 @@ void makeThreadKillable(void) {
     pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
 }
 
+#if defined(USE_JEMALLOC)
+/* Create a dedicated jemalloc arena for short-lived, non-keyspace command
+ * scratch allocations (see sortCommand's temp vector). Kept separate from
+ * long-lived key data for the same reason the Lua arena is separate (see
+ * luaEnvInit() in script.c): it lets active-defrag get an honest picture of
+ * real key fragmentation, and lets this short-lived memory be released
+ * without ever being interleaved with long-lived key data pages. */
+static void scratchArenaInit(void) {
+    if (!server.scratch_arena_enabled) {
+        server.scratch_arena = UINT_MAX;
+        return;
+    }
+    unsigned int arena;
+    size_t sz = sizeof(unsigned int);
+    if (je_mallctl("arenas.create", (void *)&arena, &sz, NULL, 0)) {
+        serverLog(LL_WARNING, "Failed creating the scratch jemalloc arena (non-fatal, "
+                               "falling back to the default arena for scratch allocations).");
+        server.scratch_arena = UINT_MAX;
+        return;
+    }
+    server.scratch_arena = arena;
+}
+#else
+static void scratchArenaInit(void) {
+    server.scratch_arena = UINT_MAX;
+}
+#endif
+
 void initServer(void) {
     int j;
 
@@ -3192,6 +3232,7 @@ void initServer(void) {
     }
 
     luaEnvInit();
+    scratchArenaInit();
     scriptingInit(1);
     if (functionsInit() == C_ERR) {
         serverPanic("Functions initialization failed, check the server logs.");
@@ -7085,7 +7126,11 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             "allocator_allocated_lua:%zu\r\n", server.cron_malloc_stats.lua_allocator_allocated,
             "allocator_active_lua:%zu\r\n", server.cron_malloc_stats.lua_allocator_active,
             "allocator_resident_lua:%zu\r\n", server.cron_malloc_stats.lua_allocator_resident,
-            "allocator_frag_bytes_lua:%zu\r\n", server.cron_malloc_stats.lua_allocator_frag_smallbins_bytes));
+            "allocator_frag_bytes_lua:%zu\r\n", server.cron_malloc_stats.lua_allocator_frag_smallbins_bytes,
+            "allocator_allocated_scratch:%zu\r\n", server.cron_malloc_stats.scratch_allocator_allocated,
+            "allocator_active_scratch:%zu\r\n", server.cron_malloc_stats.scratch_allocator_active,
+            "allocator_resident_scratch:%zu\r\n", server.cron_malloc_stats.scratch_allocator_resident,
+            "allocator_frag_bytes_scratch:%zu\r\n", server.cron_malloc_stats.scratch_allocator_frag_smallbins_bytes));
     }
 
     return info;

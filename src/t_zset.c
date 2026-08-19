@@ -2030,7 +2030,7 @@ void zaddGenericCommand(client *c, int flags) {
     /* Start parsing all the scores, we need to emit any syntax error
      * before executing additions to the sorted set, as the command should
      * either execute fully or nothing at all. */
-    scores = zmalloc(sizeof(double)*elements);
+    scores = zmalloc_scratch(sizeof(double)*elements);
     for (j = 0; j < elements; j++) {
         if (getDoubleFromObjectOrReply(c,c->argv[scoreidx+j*2],&scores[j],NULL)
             != C_OK) goto cleanup;
@@ -2915,7 +2915,7 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
     }
 
     /* Try to allocate the src table, and abort on insufficient memory. */
-    src = ztrycalloc(sizeof(zsetopsrc) * setnum);
+    src = ztrycalloc_scratch(sizeof(zsetopsrc) * setnum);
     if (src == NULL) {
         addReplyError(c, "Insufficient memory, failed allocating transient memory, too many args.");
         return;
@@ -4557,9 +4557,9 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
             listpackEntry *keys, *vals = NULL;
             unsigned long limit, sample_count;
             limit = count > ZRANDMEMBER_RANDOM_SAMPLE_LIMIT ? ZRANDMEMBER_RANDOM_SAMPLE_LIMIT : count;
-            keys = zmalloc(sizeof(listpackEntry)*limit);
+            keys = zmalloc_scratch(sizeof(listpackEntry)*limit);
             if (withscores)
-                vals = zmalloc(sizeof(listpackEntry)*limit);
+                vals = zmalloc_scratch(sizeof(listpackEntry)*limit);
             while (count) {
                 sample_count = count > limit ? limit : count;
                 count -= sample_count;
@@ -4614,9 +4614,9 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
      * listpack in CASE 4. So we use this instead. */
     if (zsetobj->encoding == OBJ_ENCODING_LISTPACK) {
         listpackEntry *keys, *vals = NULL;
-        keys = zmalloc(sizeof(listpackEntry)*count);
+        keys = zmalloc_scratch(sizeof(listpackEntry)*count);
         if (withscores)
-            vals = zmalloc(sizeof(listpackEntry)*count);
+            vals = zmalloc_scratch(sizeof(listpackEntry)*count);
         serverAssert(lpRandomPairsUnique(zsetobj->ptr, count, keys, vals, 2) == count);
         zrandmemberReplyWithListpack(c, count, keys, vals);
         zfree(keys);

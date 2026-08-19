@@ -383,8 +383,12 @@ void sortCommandGeneric(client *c, int readonly) {
         vectorlen = end-start+1;
     }
 
-    /* Load the sorting vector with all the objects to sort */
-    vector = zmalloc(sizeof(redisSortObject)*vectorlen);
+    /* Load the sorting vector with all the objects to sort. This is short-lived,
+     * command-scoped scratch memory (freed at the end of this command, never
+     * stored as a keyspace value), so tag it with the dedicated scratch arena
+     * when available to keep it out of the fragmentation-sensitive key data
+     * arenas (see scratchArenaInit() in server.c). */
+    vector = zmalloc_scratch(sizeof(redisSortObject)*vectorlen);
     j = 0;
 
     if (sortval->type == OBJ_LIST && dontsort) {

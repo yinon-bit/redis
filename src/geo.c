@@ -52,7 +52,7 @@ int zslValueLteMax(double value, zrangespec *spec);
 
 /* Create a new array of geoPoints. */
 geoArray *geoArrayCreate(void) {
-    geoArray *ga = zmalloc(sizeof(*ga));
+    geoArray *ga = zmalloc_scratch(sizeof(*ga));
     /* It gets allocated on first geoArrayAppend() call. */
     ga->array = NULL;
     ga->buckets = 0;
@@ -66,7 +66,7 @@ geoPoint *geoArrayAppend(geoArray *ga, double *xy, double dist,
 {
     if (ga->used == ga->buckets) {
         ga->buckets = (ga->buckets == 0) ? 8 : ga->buckets*2;
-        ga->array = zrealloc(ga->array,sizeof(geoPoint)*ga->buckets);
+        ga->array = zrealloc_scratch(ga->array,sizeof(geoPoint)*ga->buckets);
     }
     geoPoint *gp = ga->array+ga->used;
     gp->longitude = xy[0];

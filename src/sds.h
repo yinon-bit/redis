@@ -313,6 +313,10 @@ sds sdstemplate(const char *template, sdstemplate_callback_t cb_func, void *cb_a
 char sdsReqType(size_t string_size);
 sds sdsMakeRoomFor(sds s, size_t addlen);
 sds sdsMakeRoomForNonGreedy(sds s, size_t addlen);
+#if defined(USE_JEMALLOC)
+sds sdsMakeRoomForWithFlags(sds s, size_t addlen, int flags);
+sds sdsMakeRoomForNonGreedyWithFlags(sds s, size_t addlen, int flags);
+#endif
 void sdsIncrLen(sds s, ssize_t incr);
 sds sdsRemoveFreeSpace(sds s, int would_regrow);
 sds sdsResize(sds s, size_t size, int would_regrow);

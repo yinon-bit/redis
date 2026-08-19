@@ -3477,9 +3477,9 @@ void hrandfieldWithCountCommand(client *c, long l, int withvalues) {
             int tuple_len = hash->encoding == OBJ_ENCODING_LISTPACK ? 2 : 3;
 
             limit = count > HRANDFIELD_RANDOM_SAMPLE_LIMIT ? HRANDFIELD_RANDOM_SAMPLE_LIMIT : count;
-            keys = zmalloc(sizeof(listpackEntry)*limit);
+            keys = zmalloc_scratch(sizeof(listpackEntry)*limit);
             if (withvalues)
-                vals = zmalloc(sizeof(listpackEntry)*limit);
+                vals = zmalloc_scratch(sizeof(listpackEntry)*limit);
             while (count) {
                 sample_count = count > limit ? limit : count;
                 count -= sample_count;
@@ -3532,9 +3532,9 @@ void hrandfieldWithCountCommand(client *c, long l, int withvalues) {
         unsigned char *lp = hashTypeListpackGetLp(hash);
         int tuple_len = hash->encoding == OBJ_ENCODING_LISTPACK ? 2 : 3;
         listpackEntry *keys, *vals = NULL;
-        keys = zmalloc(sizeof(listpackEntry)*count);
+        keys = zmalloc_scratch(sizeof(listpackEntry)*count);
         if (withvalues)
-            vals = zmalloc(sizeof(listpackEntry)*count);
+            vals = zmalloc_scratch(sizeof(listpackEntry)*count);
         serverAssert(lpRandomPairsUnique(lp, count, keys, vals, tuple_len) == count);
         hrandfieldReplyWithListpack(c, count, keys, vals);
         zfree(keys);
@@ -3563,7 +3563,7 @@ void hrandfieldWithCountCommand(client *c, long l, int withvalues) {
         struct FieldValPair {
             sds field;
             sds value;
-        } *pairs = zmalloc(sizeof(struct FieldValPair) * size);
+        } *pairs = zmalloc_scratch(sizeof(struct FieldValPair) * size);
 
         /* Add all the elements into the temporary array. */
         dictInitIterator(&di, ht);

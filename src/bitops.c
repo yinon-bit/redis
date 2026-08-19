@@ -1285,11 +1285,12 @@ void bitopCommand(client *c) {
         return;
     }
 
-    /* Lookup keys, and store pointers to the string objects into an array. */
+    /* Lookup keys, and store pointers to the string objects into an array.
+     * These arrays are command-scoped scratch (never stored as key values). */
     numkeys = c->argc - 3;
-    src = zmalloc(sizeof(unsigned char*) * numkeys);
-    len = zmalloc(sizeof(long) * numkeys);
-    objects = zmalloc(sizeof(robj*) * numkeys);
+    src = zmalloc_scratch(sizeof(unsigned char*) * numkeys);
+    len = zmalloc_scratch(sizeof(long) * numkeys);
+    objects = zmalloc_scratch(sizeof(robj*) * numkeys);
     for (j = 0; j < numkeys; j++) {
         kvobj *kv = lookupKeyRead(c->db, c->argv[j + 3]);
         /* Handle non-existing keys as empty strings. */
