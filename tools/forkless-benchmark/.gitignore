@@ -1,0 +1,11 @@
+# Local evidence, credentials and operator state are not distributable code.
+results/
+__pycache__/
+*.pyc
+.DS_Store
+AWS-*-STATE.md
+*.pem
+*.key
+credentials*.json
+.env*
+.venv/

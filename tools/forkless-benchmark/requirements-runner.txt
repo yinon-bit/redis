@@ -1,0 +1,2 @@
+# Tested SDK version; install in a virtual environment.
+boto3==1.43.100

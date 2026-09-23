@@ -1,0 +1,22 @@
+{
+  "scenario": "custom",
+  "name": "hybrid-custom",
+  "instance_id": "i-0123456789abcdef0",
+  "results_s3": "s3://replace-with-your-bucket/benchmarks",
+  "region": "us-east-2",
+  "redis_binary": "/opt/redis/src/redis-server",
+  "mode": "hybrid",
+  "dataset_gib": 4,
+  "big_key_percent": 5,
+  "big_request_percent": 5,
+  "small_bytes": 256,
+  "big_bytes": 1048576,
+  "writes_per_sec": 50000,
+  "reads_per_sec": 0,
+  "clients": 32,
+  "before_seconds": 15,
+  "after_seconds": 5,
+  "timeout_seconds": 1800,
+  "port": 16379,
+  "seed": 42
+}
