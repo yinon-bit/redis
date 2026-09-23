@@ -3,6 +3,9 @@
 Experimental runner. It executes a documented subset, not the whole shared suite.
 Start here; historical scripts/reports in this directory are not this workflow.
 
+Running through an AI assistant? Give it [AI-RUNBOOK.md](AI-RUNBOOK.md), your
+requested cases/revision, and explicit AWS budget/runtime approval.
+
 Known limitations: no automatic HTML report yet; verbose RDB validation logs can
 produce hundreds of MB of compressed evidence. Cumulative archives repeat earlier
 case evidence. The 30-minute default case timeout was too short for three full-size

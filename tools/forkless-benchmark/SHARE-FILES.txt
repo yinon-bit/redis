@@ -1,5 +1,6 @@
 tools/forkless-benchmark/.gitignore
 tools/forkless-benchmark/DEVELOPER-QUICKSTART.md
+tools/forkless-benchmark/AI-RUNBOOK.md
 tools/forkless-benchmark/AWS-SCENARIO-RUNNER.md
 tools/forkless-benchmark/SHARED-POC-BENCHMARK-SPEC.md
 tools/forkless-benchmark/SHARE-FILES.txt
