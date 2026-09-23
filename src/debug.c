@@ -13,6 +13,7 @@
  */
 
 #include "server.h"
+#include "forkless.h"
 #include "util.h"
 #include "sha1.h"   /* SHA1 is used for DEBUG DIGEST */
 #include "crc64.h"
@@ -732,6 +733,16 @@ NULL
             (void*)kv, kv->refcount,
             strenc, rdbSavedObjectLen(kv, c->argv[2], c->db->id),
             kv->lru, estimateObjectIdleTime(kv)/1000, extra);
+    } else if (!strcasecmp(c->argv[1]->ptr,"forkless-cancel") && c->argc == 2) {
+        forklessNoForkCancel();
+        addReply(c,shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"forkless-arena") && c->argc == 3) {
+        kvobj *kv = dbFind(c->db, c->argv[2]->ptr);
+        if (kv == NULL) {
+            addReplyErrorObject(c,shared.nokeyerr);
+            return;
+        }
+        addReplyLongLong(c, zmallocPtrArenaIndex(kvobjGetAllocPtr(kv)));
     } else if (!strcasecmp(c->argv[1]->ptr,"keymeta-aof-dump") && c->argc == 3) {
         kvobj *kv = dbFind(c->db, c->argv[2]->ptr);
         if (kv == NULL) {

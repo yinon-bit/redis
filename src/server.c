@@ -13,6 +13,7 @@
  */
 
 #include "server.h"
+#include "forkless.h"
 #include "monotonic.h"
 #include "cluster.h"
 #include "cluster_slot_stats.h"
@@ -843,10 +844,10 @@ const char *strChildType(int type) {
     }
 }
 
-/* Return true if there are active children processes doing RDB saving,
- * AOF rewriting, or some side process spawned by a loaded module. */
+/* Gate mutually exclusive persistence work, including a full forkless save
+ * which has a parent worker and deliberately leaves child_pid at -1. */
 int hasActiveChildProcess(void) {
-    return server.child_pid != -1;
+    return server.child_pid != -1 || forklessNoForkActive() || forklessHybridCleanupPending();
 }
 
 void resetChildState(void) {
@@ -1428,6 +1429,7 @@ void exitExecutionUnit(void) {
 }
 
 void checkChildrenDone(void) {
+    if (forklessNoForkActive() && !ldbPendingChildren()) return;
     int statloc = 0;
     pid_t pid;
 
@@ -1983,6 +1985,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
         return;
     }
 
+    /* All snapshot cleanup in this event-loop turn shares one allowance. */
+    forklessResetCleanupBudget();
+
     /* Handle pending data(typical TLS). (must be done before flushAppendOnlyFile) */
     connTypeProcessPendingData(server.el);
     /* Drain any buffered decompressed replication data (see client_comp.c). */
@@ -2016,6 +2021,11 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
      * ASAP if a fast cycle is not needed). */
     if (server.active_expire_enabled && iAmMaster())
         activeExpireCycle(ACTIVE_EXPIRE_CYCLE_FAST);
+
+    /* Release snapshot references the forkless serializer finished with. */
+    if (forklessReleaseDonePins()) dont_sleep = 1;
+    if (forklessNoForkCron()) dont_sleep = 1;
+    forklessHybridCron();
 
     if (moduleCount()) {
         moduleFireServerEvent(REDISMODULE_EVENT_EVENTLOOP,
@@ -3248,6 +3258,10 @@ void initServer(void) {
     }
 
     luaEnvInit();
+    if (forklessInit() != C_OK) {
+        serverLog(LL_WARNING, "Invalid forkless BGSAVE configuration. Exiting.");
+        exit(1);
+    }
     scriptingInit(1);
     if (functionsInit() == C_ERR) {
         serverPanic("Functions initialization failed, check the server logs.");
@@ -6738,6 +6752,9 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             "rdb_saves:%lld\r\n", server.stat_rdb_saves,
             "rdb_saves_consecutive_failures:%lld\r\n", server.stat_rdb_consecutive_failures,
             "rdb_last_cow_size:%zu\r\n", server.stat_rdb_cow_bytes,
+            "bgsave_mode:%s\r\n", bgsaveModeName(),
+            "forkless_arena:%u\r\n", forklessArenaIndex(),
+            "forkless_priority_keys:%llu\r\n", forklessPriorityKeys(),
             "rdb_last_load_keys_expired:%lld\r\n", server.rdb_last_load_keys_expired,
             "rdb_last_load_keys_loaded:%lld\r\n", server.rdb_last_load_keys_loaded,
             "aof_enabled:%d\r\n", server.aof_state != AOF_OFF,
@@ -6756,6 +6773,8 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             "backup_in_progress:%d\r\n", backupIsInProgress(),
             "module_fork_in_progress:%d\r\n", server.child_type == CHILD_TYPE_MODULE,
             "module_fork_last_cow_size:%zu\r\n", server.stat_module_cow_bytes));
+
+        info = forklessAppendInfo(info);
 
         if (server.aof_enabled) {
             info = sdscatprintf(info, FMTARGS(
@@ -7604,6 +7623,13 @@ void closeChildUnusedResourceAfterFork(void) {
 
 /* purpose is one of CHILD_TYPE_ types */
 int redisFork(int purpose) {
+    if (purpose != CHILD_TYPE_RDB && !forklessNonRdbForkAllowed()) {
+        serverLog(LL_WARNING,
+                  "Cannot fork %s: snapshot arena pages are excluded from child processes; use bgsave-mode fork",
+                  strChildType(purpose));
+        errno = ENOTSUP;
+        return -1;
+    }
     if (isMutuallyExclusiveChildType(purpose)) {
         if (hasActiveChildProcess()) {
             errno = EEXIST;
@@ -8134,6 +8160,7 @@ struct redisTest {
     {"sds", sdsTest},
     {"mstr", mstrTest},
     {"dict", dictTest},
+    {"forkless", forklessTest},
     {"listpack", listpackTest},
     {"kvstore", kvstoreTest},
     {"fwtree", fwtreeTest},

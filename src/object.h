@@ -31,6 +31,7 @@
  * 
  * When iskvobj is set, it also contains:
  *   - metabits: bitmap of additional metadata attached to the object.
+ *   - snapshot: two non-persistent progress bits (not metadata slots).
  *   - lru: LRU time (relative to global lru_clock) or LFU data (see robj above).
  *   - embedded key: the key string is stored inline after the struct.
  *   - embedded value: for small strings, the value is stored inline after the key.
@@ -93,7 +94,8 @@ struct RedisModuleType;
 #define LRU_CLOCK_MAX ((1<<LRU_BITS)-1) /* Max value of obj->lru */
 #define LRU_CLOCK_RESOLUTION 1000 /* LRU clock resolution in ms */
 
-#define OBJ_NUM_KVMETA_BITS 8
+#define OBJ_NUM_KVMETA_BITS 6
+#define OBJ_NUM_SNAPSHOT_BITS 2
 #define OBJ_REFCOUNT_BITS 23
 #define OBJ_SHARED_REFCOUNT ((1 << OBJ_REFCOUNT_BITS) - 1) /* Global object never destroyed. */
 #define OBJ_STATIC_REFCOUNT ((1 << OBJ_REFCOUNT_BITS) - 2) /* Object allocated in the stack. */
@@ -106,7 +108,9 @@ struct redisObject {
     unsigned iskvobj : 1;   /* 1 if this struct serves as a kvobj base */
     
     /* metabits and lru are Relevant only when iskvobj is set: */     
-    unsigned metabits :8;  /* Bitmap of metadata (+expiry) attached to this kvobj */
+    /* A separate byte: helper progress stores must not touch the adjacent
+     * LRU or refcount words. Access through the atomic helpers below. */
+    unsigned char kvflags;
     unsigned lru:LRU_BITS; /* LRU time (relative to global lru_clock) or
                             * LFU data (least significant 8 bits frequency
                             * and most significant 16 bits access time). */
@@ -115,6 +119,27 @@ struct redisObject {
 
 /* robj - General purpose redis object */
 typedef struct redisObject robj;
+
+_Static_assert(sizeof(robj) == 8 + sizeof(void *), "Snapshot bits must not grow robj");
+_Static_assert(OBJ_NUM_KVMETA_BITS + OBJ_NUM_SNAPSHOT_BITS == 8, "Flags must fit one byte");
+
+static inline unsigned kvobjMetaBits(const robj *o) {
+    return __atomic_load_n(&o->kvflags, __ATOMIC_RELAXED) & ((1U << OBJ_NUM_KVMETA_BITS) - 1);
+}
+
+static inline unsigned kvobjSnapshot(const robj *o) {
+    return __atomic_load_n(&o->kvflags, __ATOMIC_ACQUIRE) >> OBJ_NUM_KVMETA_BITS;
+}
+
+/* Metadata allocation is immutable after publication. Only the progress
+ * bits change. The save read guard prevents concurrent progress writers;
+ * atomic byte access also permits unrelated main-thread metadata reads.
+ * Release/acquire publishes completion of the helper's live-object read to
+ * the main-thread capture fast path, which may then mutate an unshared object. */
+static inline void kvobjSetSnapshot(robj *o, unsigned mark) {
+    unsigned char flags = kvobjMetaBits(o) | (mark << OBJ_NUM_KVMETA_BITS);
+    __atomic_store_n(&o->kvflags, flags, __ATOMIC_RELEASE);
+}
 
 /* kvobj: see header comment above for definition and memory layout. */
 typedef struct redisObject kvobj;
@@ -166,6 +191,7 @@ robj *createZsetListpackObject(void);
 robj *createStreamObject(void);
 robj *createGCRAObject(long long value);
 robj *createModuleObject(struct RedisModuleType *mt, void *value);
+size_t moduleObjectCount(void);
 robj *createArrayObject(void);
 int getLongFromObjectOrReply(struct client *c, robj *o, long *target, const char *msg);
 int getPositiveLongFromObjectOrReply(struct client *c, robj *o, long *target, const char *msg);
@@ -195,7 +221,7 @@ void memoryCommand(struct client *c);
 
 static inline void *kvobjGetAllocPtr(const kvobj *kv) {
     /* Return the base allocation pointer (start of the metadata prefix). */
-    uint32_t numMetaBytes = __builtin_popcount(kv->metabits) * sizeof(uint64_t);
+    uint32_t numMetaBytes = __builtin_popcount(kvobjMetaBits(kv)) * sizeof(uint64_t);
     return (char *)kv - numMetaBytes;
 }
 

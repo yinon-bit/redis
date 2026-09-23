@@ -17,6 +17,7 @@
 #include "cluster.h"
 #include "connection.h"
 #include "bio.h"
+#include "forkless.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -158,6 +159,13 @@ configEnum cluster_preferred_endpoint_type_enum[] = {
     {"ip", CLUSTER_ENDPOINT_TYPE_IP},
     {"hostname", CLUSTER_ENDPOINT_TYPE_HOSTNAME},
     {"unknown-endpoint", CLUSTER_ENDPOINT_TYPE_UNKNOWN_ENDPOINT},
+    {NULL, 0}
+};
+
+configEnum bgsave_mode_enum[] = {
+    {"fork", BGSAVE_MODE_FORK},
+    {"forkless", BGSAVE_MODE_FORKLESS},
+    {"hybrid", BGSAVE_MODE_HYBRID},
     {NULL, 0}
 };
 
@@ -2689,6 +2697,11 @@ static int updateWatchdogPeriod(const char **err) {
 }
 
 static int updateAppendonly(const char **err) {
+    if (server.aof_enabled && server.bgsave_mode != BGSAVE_MODE_FORK) {
+        *err = "AOF is not supported by the selected bgsave-mode.";
+        return 0;
+    }
+
     /* If loading flag is set, AOF might have been stopped temporarily, and it
      * will be restarted depending on server.aof_enabled flag after loading is
      * completed. So, we just need to update 'server.aof_enabled' which has been
@@ -2705,6 +2718,20 @@ static int updateAppendonly(const char **err) {
         }
     }
     return 1;
+}
+
+/* Both arenas exist from startup on jemalloc builds. Changing the mode flips
+ * page inheritance without walking existing keys. Allocation policy changes
+ * involving hybrid apply as values are rewritten; they do not immediately
+ * reclassify the entire existing dataset. */
+static int updateBgsaveMode(const char **err) {
+    if (server.bgsave_mode != BGSAVE_MODE_FORK) {
+        if (server.aof_enabled || server.aof_state != AOF_OFF) {
+            *err = "AOF is not supported by the selected bgsave-mode.";
+            return 0;
+        }
+    }
+    return forklessApplyModeChange(server.bgsave_mode, err) == C_OK;
 }
 
 static int updateAofAutoGCEnabled(const char **err) {
@@ -3433,6 +3460,7 @@ standardConfig static_configs[] = {
     createEnumConfig("syslog-facility", NULL, IMMUTABLE_CONFIG, syslog_facility_enum, server.syslog_facility, LOG_LOCAL0, NULL, NULL),
     createEnumConfig("repl-diskless-load", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG | DENY_LOADING_CONFIG, repl_diskless_load_enum, server.repl_diskless_load, REPL_DISKLESS_LOAD_DISABLED, NULL, NULL),
     createEnumConfig("loglevel", NULL, MODIFIABLE_CONFIG, loglevel_enum, server.verbosity, LL_NOTICE, NULL, NULL),
+    createEnumConfig("bgsave-mode", NULL, MODIFIABLE_CONFIG, bgsave_mode_enum, server.bgsave_mode, BGSAVE_MODE_FORK, NULL, updateBgsaveMode),
     createEnumConfig("maxmemory-policy", NULL, MODIFIABLE_CONFIG, maxmemory_policy_enum, server.maxmemory_policy, MAXMEMORY_NO_EVICTION, NULL, NULL),
     createEnumConfig("appendfsync", NULL, MODIFIABLE_CONFIG, aof_fsync_enum, server.aof_fsync, AOF_FSYNC_EVERYSEC, NULL, updateAppendFsync),
     createEnumConfig("oom-score-adj", NULL, MODIFIABLE_CONFIG, oom_score_adj_enum, server.oom_score_adj, OOM_SCORE_ADJ_NO, NULL, updateOOMScoreAdj),
@@ -3535,6 +3563,9 @@ standardConfig static_configs[] = {
     createULongLongConfig("cluster-link-sendbuf-limit", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.cluster_link_msg_queue_limit_bytes, 0, MEMORY_CONFIG, NULL, NULL),
 
     /* Size_t configs */
+    createSizeTConfig("forkless-string-max", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.forkless_string_max, 500*1024, MEMORY_CONFIG, NULL, NULL),
+    createSizeTConfig("forkless-retained-max-memory", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.forkless_retained_max_memory, 0, MEMORY_CONFIG, NULL, NULL),
+    createSizeTConfig("forkless-snapshot-max-memory", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.forkless_snapshot_max_memory, 0, MEMORY_CONFIG, NULL, NULL),
     createSizeTConfig("hash-max-listpack-entries", "hash-max-ziplist-entries", MODIFIABLE_CONFIG, 0, LONG_MAX, server.hash_max_listpack_entries, 512, INTEGER_CONFIG, NULL, NULL),
     createSizeTConfig("hash-min-template-entries", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.hash_min_template_entries, 0, INTEGER_CONFIG, NULL, NULL),
     createSizeTConfig("hash-max-template-entries", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.hash_max_template_entries, 0, INTEGER_CONFIG, NULL, NULL),

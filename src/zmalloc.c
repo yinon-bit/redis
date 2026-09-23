@@ -234,6 +234,62 @@ static void zmalloc_default_oom(size_t size) {
 
 static void (*zmalloc_oom_handler)(size_t) = zmalloc_default_oom;
 
+#if defined(USE_JEMALLOC)
+static __thread int zmalloc_tls_flags = 0;
+
+void zmalloc_set_thread_flags(int flags) {
+    zmalloc_tls_flags = flags;
+}
+
+int zmalloc_get_thread_flags(void) {
+    return zmalloc_tls_flags;
+}
+
+/* Forkless BGSAVE keeps DB values in a dedicated arena whose pages may carry
+ * MADV_DONTFORK. jemalloc's thread cache is not arena aware: arena_dalloc()
+ * pushes a freed region into the caller's cache bin without recording which
+ * arena it came from, and a later allocation of that size class pops it back.
+ * A DONTFORK region freed through the automatic tcache would therefore be
+ * handed to unrelated memory, which the RDB child may legitimately read.
+ *
+ * Frees and reallocs inside the window below bypass the tcache so those pages
+ * can only ever return to their own arena. The window is the bounding box of
+ * the arena's extents, so it can also contain unrelated pointers; that is
+ * deliberate. A false positive costs the tcache fast path and nothing else,
+ * while a false negative would be a correctness bug, so the test is
+ * conservative in the safe direction. */
+static redisAtomic size_t zmalloc_nofork_lo = 0;
+static redisAtomic size_t zmalloc_nofork_hi = 0;
+
+void zmallocNoTcacheWindowAdd(void *addr, size_t size) {
+    size_t lo = (size_t)(uintptr_t)addr;
+    size_t hi = lo + size;
+    size_t cur;
+
+    atomicGet(zmalloc_nofork_lo, cur);
+    if (cur == 0 || lo < cur) atomicSet(zmalloc_nofork_lo, lo);
+    atomicGet(zmalloc_nofork_hi, cur);
+    if (hi > cur) atomicSet(zmalloc_nofork_hi, hi);
+}
+
+/* Callers must publish an extent before handing its memory out, so any pointer
+ * that can reach a free path is already inside the window. */
+static inline int zmallocNoTcachePtr(const void *ptr) {
+    size_t hi, lo, p = (size_t)(uintptr_t)ptr;
+    atomicGet(zmalloc_nofork_hi, hi);
+    if (hi == 0) return 0;
+    atomicGet(zmalloc_nofork_lo, lo);
+    return p >= lo && p < hi;
+}
+#else
+void zmallocNoTcacheWindowAdd(void *addr, size_t size) {
+    UNUSED(addr);
+    UNUSED(size);
+}
+#define zmallocNoTcachePtr(ptr) (0)
+#endif
+
+
 #ifdef HAVE_MALLOC_SIZE
 void *extend_to_usable(void *ptr, size_t size) {
     UNUSED(size);
@@ -246,6 +302,16 @@ void *extend_to_usable(void *ptr, size_t size) {
 static inline void *ztrymalloc_usable_internal(size_t size, size_t *usable) {
     /* Possible overflow, return NULL, so that the caller can panic or handle a failed allocation. */
     if (size >= SIZE_MAX/2) return NULL;
+#if defined(USE_JEMALLOC)
+    if (zmalloc_tls_flags) {
+        void *ptr = mallocx(MALLOC_MIN_SIZE(size)+PREFIX_SIZE, zmalloc_tls_flags);
+        if (!ptr) return NULL;
+        size = zmalloc_size(ptr);
+        update_zmalloc_stat_alloc(size);
+        if (usable) *usable = size;
+        return ptr;
+    }
+#endif
 #ifdef HAVE_ALLOC_WITH_USIZE
     void *ptr = malloc_with_usize(MALLOC_MIN_SIZE(size)+PREFIX_SIZE, &size);
 #else
@@ -307,6 +373,15 @@ void *zmalloc_usable(size_t size, size_t *usable) {
 }
 
 #if defined(USE_JEMALLOC)
+int zmallocPtrArenaIndex(void *ptr) {
+    if (ptr == NULL) return -1;
+    unsigned arena = 0;
+    size_t size = sizeof(arena);
+    if (je_mallctl("arenas.lookup", &arena, &size, &ptr, sizeof(ptr)) != 0)
+        return -1;
+    return (int)arena;
+}
+
 void *zmalloc_with_flags(size_t size, int flags) {
     if (size >= SIZE_MAX/2) zmalloc_oom_handler(size);
     void *ptr = mallocx(size+PREFIX_SIZE, flags);
@@ -351,6 +426,11 @@ void zfree_with_flags(void *ptr, int flags) {
     update_zmalloc_stat_free(zmalloc_size(ptr));
     dallocx(ptr, flags);
 }
+#else
+int zmallocPtrArenaIndex(void *ptr) {
+    UNUSED(ptr);
+    return -1;
+}
 #endif
 
 /* Allocation and free functions that bypass the thread cache
@@ -377,6 +457,17 @@ void zfree_no_tcache(void *ptr) {
 static inline void *ztrycalloc_usable_internal(size_t size, size_t *usable) {
     /* Possible overflow, return NULL, so that the caller can panic or handle a failed allocation. */
     if (size >= SIZE_MAX/2) return NULL;
+#if defined(USE_JEMALLOC)
+    if (zmalloc_tls_flags) {
+        void *ptr = mallocx(MALLOC_MIN_SIZE(size)+PREFIX_SIZE,
+                            zmalloc_tls_flags | MALLOCX_ZERO);
+        if (ptr == NULL) return NULL;
+        size = zmalloc_size(ptr);
+        update_zmalloc_stat_alloc(size);
+        if (usable) *usable = size;
+        return ptr;
+    }
+#endif
 #ifdef HAVE_ALLOC_WITH_USIZE
     void *ptr = calloc_with_usize(1, MALLOC_MIN_SIZE(size)+PREFIX_SIZE, &size);
 #else
@@ -485,6 +576,44 @@ static inline void *ztryrealloc_usable_internal(void *ptr, size_t size, size_t *
         *old_usable = oldsize;
         return NULL;
     }
+#if defined(USE_JEMALLOC)
+    if (zmalloc_tls_flags) {
+        oldsize = zmalloc_size(ptr);
+        newptr = rallocx(ptr, size + PREFIX_SIZE, zmalloc_tls_flags);
+        if (newptr == NULL) {
+            *usable = 0;
+            *old_usable = oldsize;
+            return NULL;
+        }
+        size = zmalloc_size(newptr);
+        update_zmalloc_stat_free(oldsize);
+        update_zmalloc_stat_alloc(size);
+        *usable = size;
+        *old_usable = oldsize;
+        return newptr;
+    }
+    if (zmallocNoTcachePtr(ptr)) {
+        /* rallocx frees the old region, so it must bypass the tcache too.
+         * MALLOCX_ARENA is deliberately not set: the window is conservative,
+         * and pinning an unrelated pointer into the forkless arena is the
+         * unsafe direction. A forkless payload that drifts into another arena
+         * stays correct (it is still tagged, so the parent serializes it) and
+         * is re-routed by the next DB-level update. */
+        oldsize = zmalloc_size(ptr);
+        newptr = rallocx(ptr, size + PREFIX_SIZE, MALLOCX_TCACHE_NONE);
+        if (newptr == NULL) {
+            *usable = 0;
+            *old_usable = oldsize;
+            return NULL;
+        }
+        size = zmalloc_size(newptr);
+        update_zmalloc_stat_free(oldsize);
+        update_zmalloc_stat_alloc(size);
+        *usable = size;
+        *old_usable = oldsize;
+        return newptr;
+    }
+#endif
 #ifdef HAVE_ALLOC_WITH_USIZE
     newptr = realloc_with_usize(ptr, size, &oldsize, &size);
     if (newptr == NULL) {
@@ -585,6 +714,13 @@ size_t zmalloc_usable_size(void *ptr) {
 void zfree(void *ptr) {
     if (ptr == NULL) return;
 
+#if defined(USE_JEMALLOC)
+    if (zmallocNoTcachePtr(ptr)) {
+        update_zmalloc_stat_free(zmalloc_size(ptr));
+        dallocx(ptr, MALLOCX_TCACHE_NONE);
+        return;
+    }
+#endif
 #ifdef HAVE_ALLOC_WITH_USIZE
     size_t oldsize;
     free_with_usize(ptr, &oldsize);
@@ -613,6 +749,14 @@ void zfree_usable(void *ptr, size_t *usable) {
         return;
     }
 
+#if defined(USE_JEMALLOC)
+    if (zmallocNoTcachePtr(ptr)) {
+        update_zmalloc_stat_free(oldsize = zmalloc_size(ptr));
+        dallocx(ptr, MALLOCX_TCACHE_NONE);
+        if (usable) *usable = oldsize;
+        return;
+    }
+#endif
 #ifdef HAVE_ALLOC_WITH_USIZE
     free_with_usize(ptr, &oldsize);
     update_zmalloc_stat_free(oldsize);
@@ -636,7 +780,7 @@ void zfree_with_size(void *ptr, size_t size) {
     if (ptr == NULL) return;
 #ifdef USE_JEMALLOC
     update_zmalloc_stat_free(size);
-    je_sdallocx(ptr, size, 0);
+    je_sdallocx(ptr, size, zmallocNoTcachePtr(ptr) ? MALLOCX_TCACHE_NONE : 0);
 #else
     UNUSED(size);
     zfree(ptr);

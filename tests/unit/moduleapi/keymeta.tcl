@@ -2,8 +2,8 @@
 # Key Metadata (keymeta) Test Suite
 # ============================================================================
 #
-# Tests the Redis module key metadata framework: up to 7 independent metadata
-# classes (IDs 1-7) can be attached to keys. Class ID 0 is reserved for key
+# Tests the Redis module key metadata framework: up to 5 independent metadata
+# classes (IDs 1-5) can be attached to keys. Class ID 0 is reserved for key
 # expiration.
 #
 # The following features are sensitive to Key Metadata and are tested here:
@@ -17,7 +17,7 @@
 #   - Managed via db->hexpires ebuckets (holds direct kvobj pointer)
 #   - Must be removed before kvobj reallocation (hashTypeRemoveFromExpires)
 #      and restored after (hashTypeAddToExpires)
-# - MODULE METADATA (class IDs 1-7)
+# - MODULE METADATA (class IDs 1-5)
 #   - Defines metadata lifecycle via callbacks
 # - EMBEDDED STRINGS vs. REGULAR OBJECTS
 #   - Short strings and numbers are embedded into kvobj
@@ -107,22 +107,26 @@ start_server {tags {"modules" "external:skip" "cluster:skip"} overrides {enable-
     set classesSpec(3) "KEEPONCOPY:ALLOWIGNORE:RDBLOAD:RDBSAVE"
     set classesSpec(4) "ALLOWIGNORE:RDBLOAD:RDBSAVE"
     set classesSpec(5) "KEEPONRENAME:KEEPONMOVE:ALLOWIGNORE:RDBLOAD:RDBSAVE"
-    set classesSpec(6) "KEEPONRENAME:ALLOWIGNORE:RDBLOAD:RDBSAVE"
-    set classesSpec(7) "KEEPONMOVE:UNLINKFREE:ALLOWIGNORE:RDBLOAD:RDBSAVE"
 
     array set classes {}
-    for {set cid 1} {$cid <= 7} {incr cid} {
+    for {set cid 1} {$cid <= 5} {incr cid} {
         set spec $classesSpec($cid)
         set classes($cid) [r keymeta.register [cname $cid] 1 $spec]
         puts "Registered class $cid with spec $spec"
         assert_equal $classes($cid) $cid
     }
 
+    test {KEYMETA rejects a sixth module slot reserved for snapshot flags} {
+        assert_error {*failed to create metadata class*} {
+            r keymeta.register KMT6 1 ALLOWIGNORE:RDBLOAD:RDBSAVE
+        }
+    }
+
     # Validates metadata behavior across COPY/RENAME/MOVE operations
-    # with varying numbers of metadata classes (1-7), key expiration states,
+    # with varying numbers of metadata classes (1-5), key expiration states,
     # key types (string/hash), hash field expiration, and metadata class flags
     # (KEEPONCOPY, KEEPONRENAME, KEEPONMOVE).
-    for {set numClasses 1} {$numClasses < 8} {incr numClasses} {
+    for {set numClasses 1} {$numClasses < 6} {incr numClasses} {
         foreach expiryBefore {0 1} {
             foreach expiryAfter {0 1} {
                 set hasExpiry [expr {$expiryBefore || $expiryAfter}]
@@ -239,7 +243,7 @@ start_server {tags {"modules" "external:skip" "cluster:skip"} overrides {enable-
     }
 
     test "KEYMETA - Verify active metadata count on copy" {
-        for {set cid 1} {$cid < 7} {incr cid} {
+        for {set cid 1} {$cid <= 5} {incr cid} {
             set numAlloc 0
             flushallAndVerifyCleanup
             set dupOnCopy [shouldKeep $cid "copy" classesSpec]
@@ -258,7 +262,7 @@ start_server {tags {"modules" "external:skip" "cluster:skip"} overrides {enable-
     }
 
     test "KEYMETA - Verify active metadata count on rename" {
-        for {set cid 1} {$cid <= 7} {incr cid} {
+        for {set cid 1} {$cid <= 5} {incr cid} {
             set numAlloc 0
             flushallAndVerifyCleanup
             set keepOnRename [shouldKeep $cid "rename" classesSpec]
@@ -274,7 +278,7 @@ start_server {tags {"modules" "external:skip" "cluster:skip"} overrides {enable-
     }
 
     test "KEYMETA - Verify active metadata count on move" {
-        for {set cid 1} {$cid <= 7} {incr cid} {
+        for {set cid 1} {$cid <= 5} {incr cid} {
             set numAlloc 0
             r select 0
             flushallAndVerifyCleanup
@@ -472,9 +476,9 @@ start_server {tags {"modules" "external:skip" "cluster:skip"} overrides {enable-
         flushallAndVerifyCleanup
     } {} {external:skip needs:debug}
 
-    test {RDB: Create keys with upto 7 meta classes, with or without expiry} {
-        # Test all combinations of 1-7 metadata classes, with or without expiry
-        for {set n 1} {$n <= 7} {incr n} {
+    test {RDB: Create keys with upto 5 meta classes, with or without expiry} {
+        # Test all combinations of 1-5 metadata classes, with or without expiry
+        for {set n 1} {$n <= 5} {incr n} {
             foreach hasExpiry {0 1} {
                 set keyname "key_${n}_exp${hasExpiry}"
                 r set $keyname "value$n"
@@ -503,7 +507,7 @@ start_server {tags {"modules" "external:skip" "cluster:skip"} overrides {enable-
 
                 # Verify metadata before RDB save
                 # Verify exactly n metadata classes are attached
-                for {set i 1} {$i <= 7} {incr i} {
+                for {set i 1} {$i <= 5} {incr i} {
                     if {$i <= $n} {
                         assert_equal [r keymeta.get [cname $i] $keyname] "meta$i"
                     } else {
@@ -523,7 +527,7 @@ start_server {tags {"modules" "external:skip" "cluster:skip"} overrides {enable-
 
                 # Verify metadata after RDB reload
                 # Verify exactly n metadata classes are still attached
-                for {set i 1} {$i <= 7} {incr i} {
+                for {set i 1} {$i <= 5} {incr i} {
                     if {$i <= $n} {
                         assert_equal [r keymeta.get [cname $i] $keyname] "meta$i"
                     } else {
@@ -617,9 +621,9 @@ start_server {tags {"modules" "external:skip" "cluster:skip"} overrides {enable-
     # DUMP/RESTORE Tests
     # ========================================================================
 
-    test {DUMP/RESTORE: 1 to 7 metadata classes, optional TTL} {
+    test {DUMP/RESTORE: 1 to 5 metadata classes, optional TTL} {
         foreach withTTL {0 1} {
-            for {set numClasses 1} {$numClasses < 8} {incr numClasses} {
+            for {set numClasses 1} {$numClasses < 6} {incr numClasses} {
                 # Re-register classes with RDBLOAD and RDBSAVE flags
                 for {set cid 1} {$cid <= $numClasses} {incr cid} {
                     r keymeta.unregister [cname $cid]

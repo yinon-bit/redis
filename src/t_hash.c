@@ -11,6 +11,7 @@
  */
 
 #include "server.h"
+#include "forkless.h"
 #include "bio.h"
 #include "redisassert.h"
 #include "ebuckets.h"
@@ -2138,6 +2139,7 @@ GetFieldRes hashTypeGetValue(redisDb *db, kvobj *o, sds field, unsigned char **v
         return GETF_EXPIRED;
 
     /* delete the field and propagate the deletion */
+    forklessCaptureMetadata(db, o);
     if (server.memory_tracking_enabled && !(hfeFlags & HFE_LAZY_NO_UPDATE_ALLOCSIZES))
         oldsize = kvobjAllocSize(o);
     serverAssert(hashTypeDelete(o, field) == 1);
@@ -2623,6 +2625,9 @@ int hashTypeSetExInit(robj *key, kvobj *o, client *c, redisDb *db,
 
     /* Read minExpire from attached ExpireMeta to the hash */
     ex->minExpire = hashTypeGetMinExpire(o, 0);
+    /* HEXPIRE/HGETEX/HSETEX convert listpack hashes to listpack-ex or a
+     * hashtable. Listpack-ex stays parent-owned; hashtables move back. */
+    ex->hashObj = forklessFinalizeHashValue(db, key, o);
     return C_OK;
 }
 
@@ -3587,6 +3592,9 @@ void rdbLoadTemplateCtxDisassemble(rdbLoadTemplateCtx *ctx) {
              * to keep it consistent (otherwise dbgAssertAllocSizePerSlot panics
              * and INFO reports wrong sizes). Field count is unchanged, so the
              * key-size histogram needs no fixup. */
+            robj keyobj;
+            initStaticStringObject(keyobj, ref->key);
+            o = forklessFinalizeHashValue(ref->db, &keyobj, o);
             if (server.memory_tracking_enabled)
                 updateSlotAllocSize(ref->db, getKeySlot(kvobjGetKey(o)), o,
                                     oldsize, kvobjAllocSize(o));
@@ -3941,6 +3949,7 @@ void hashTypeRandomElement(robj *hashobj, unsigned long hashsize, CommonEntry *k
  * - EB_EXPIRE_TIME_INVALID if no more fields to expire
  */
 uint64_t hashTypeExpire(redisDb *db, kvobj *o, uint32_t *quota, int updateSubexpires, int activeEx) {
+    forklessCaptureMetadata(db, o);
     uint64_t noExpireLeftRes = EB_EXPIRE_TIME_INVALID;
 
     /* Collect expired field names for batched subkey notification.
@@ -4190,6 +4199,7 @@ void hsetnxCommand(client *c) {
         oldsize = kvobjAllocSize(kv);
     hashTypeTryConversion(c->db, kv, c->argv, 2, 3);
     hashTypeSet(c->db, kv, c->argv[2]->ptr, c->argv[3]->ptr, HASH_SET_COPY);
+    kv = forklessFinalizeHashValue(c->db, c->argv[1], kv);
     addReply(c, shared.cone);
     keyModified(c,c->db,c->argv[1], kv, 1);
     hlen = hashTypeLength(kv, 0);
@@ -4293,6 +4303,7 @@ void hsetCommand(client *c) {
      * to avoid a template lookup for each field set. */
     hashTypeTryConvertToTemplate(kv, server.hash_min_template_entries,
                                  server.hash_max_template_entries, NULL);
+    kv = forklessFinalizeHashValue(c->db, c->argv[1], kv);
 
 
     /* HMSET (deprecated) and HSET return value is different. */
@@ -4924,8 +4935,10 @@ void hsetexCommand(client *c) {
 
     /* Check if we will set the expiration time. */
     set_expiry = flags & (HFE_EX | HFE_PX | HFE_EXAT | HFE_PXAT);
-    if (set_expiry)
+    if (set_expiry) {
         hashTypeSetExInit(c->argv[1], o, c, c->db, 0, &setex);
+        o = setex.hashObj;
+    }
 
     if (hashTypeIsTemplate(o)) {
         /* Template hash: set every field at once in a single template switch. */
@@ -4983,6 +4996,7 @@ void hsetexCommand(client *c) {
     addReplyLongLong(c, 1);
 
 out:
+    o = forklessFinalizeHashValue(c->db, c->argv[1], o);
     if (server.memory_tracking_enabled)
         updateSlotAllocSize(c->db, getKeySlot(c->argv[1]->ptr), o, oldsize, kvobjAllocSize(o));
     /* Emit keyspace notifications based on field expiry, mutation, or key deletion */
@@ -5073,6 +5087,7 @@ void hincrbyCommand(client *c) {
     hashTypeTryConversion(c->db, o, argv, 0, 1);
 
     hashTypeSet(c->db, o,c->argv[2]->ptr,new,HASH_SET_TAKE_VALUE | HASH_SET_KEEP_TTL);
+    o = forklessFinalizeHashValue(c->db, c->argv[1], o);
     if (server.memory_tracking_enabled)
         updateSlotAllocSize(c->db, getKeySlot(c->argv[1]->ptr), o, oldsize, kvobjAllocSize(o));
     addReplyLongLong(c,value);
@@ -5137,6 +5152,7 @@ void hincrbyfloatCommand(client *c) {
     hashTypeTryConversion(c->db, o, argv, 0, 1);
 
     hashTypeSet(c->db, o,c->argv[2]->ptr,new,HASH_SET_TAKE_VALUE | HASH_SET_KEEP_TTL);
+    o = forklessFinalizeHashValue(c->db, c->argv[1], o);
     if (server.memory_tracking_enabled)
         updateSlotAllocSize(c->db, getKeySlot(c->argv[1]->ptr), o, oldsize, kvobjAllocSize(o));
     addReplyBulkCBuffer(c,buf,len);
@@ -5388,8 +5404,10 @@ void hgetexCommand(client *c) {
     if (server.memory_tracking_enabled)
         oldsize = kvobjAllocSize(o);
     oldlen = hashTypeLength(o, 0);
-    if (parse_flags)
+    if (parse_flags) {
         hashTypeSetExInit(c->argv[1], o, c, c->db, 0, &setex);
+        o = setex.hashObj;
+    }
 
     /* Track fields for subkey notifications by event type. */
     fieldvec fvexpired, fvdeleted, fvupdated;
@@ -6609,6 +6627,7 @@ static void hexpireGenericCommand(client *c, long long basetime, int unit) {
 
     HashTypeSetEx exCtx;
     hashTypeSetExInit(keyArg, hashObj, c, c->db, args.expireCondition, &exCtx);
+    hashObj = exCtx.hashObj;
     addReplyArrayLen(c, args.fieldCount);
 
     /* Lazy allocation of fieldsToRemove - only allocate when failures occur */

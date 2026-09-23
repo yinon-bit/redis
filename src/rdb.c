@@ -23,6 +23,7 @@
 #include "bio.h"
 #include "cluster_asm.h"
 #include "keymeta.h"
+#include "forkless.h"
 
 #include <math.h>
 #include <fcntl.h>
@@ -44,6 +45,24 @@
     ((server.current_client == NULL || server.current_client->id == CLIENT_ID_AOF) ? 0 : 1)
 
 char* rdbFileBeingLoaded = NULL; /* used for rdb checking on read error */
+
+/* Background serializers use settings frozen at their snapshot boundary. */
+static __thread int rdb_thread_snapshot;
+static __thread int rdb_thread_compression;
+static __thread long long rdb_thread_now;
+static __thread long long rdb_thread_delay;
+static __thread hashTemplate *rdb_thread_template;
+
+void rdbSetThreadSnapshot(int compression, long long now, long long delay) {
+    rdb_thread_snapshot = 1;
+    rdb_thread_compression = compression;
+    rdb_thread_now = now;
+    rdb_thread_delay = delay;
+}
+
+void rdbSetThreadSnapshotTemplate(hashTemplate *tmpl) {
+    rdb_thread_template = tmpl;
+}
 
 extern int rdbCheckMode;
 void rdbCheckError(const char *fmt, ...);
@@ -469,7 +488,7 @@ ssize_t rdbSaveRawString(rio *rdb, unsigned char *s, size_t len) {
 
     /* Try LZF compression - under 20 bytes it's unable to compress even
      * aaaaaaaaaaaaaaaaaa so skip it */
-    if (server.rdb_compression && len > 20) {
+    if ((rdb_thread_snapshot ? rdb_thread_compression : server.rdb_compression) && len > 20) {
         n = rdbSaveLzfStringObject(rdb,s,len);
         if (n == -1) return -1;
         if (n > 0) return n;
@@ -830,7 +849,7 @@ ssize_t rdbSaveStreamIdmpEntries(rio *rdb, stream *s) {
 
     if (num_producers == 0) return nwritten;
 
-    uint64_t expire_time = server.mstime - (s->idmp_duration * 1000);
+    uint64_t expire_time = (rdb_thread_snapshot ? rdb_thread_now : server.mstime) - (s->idmp_duration * 1000);
 
     /* Iterate through all producers. */
     raxIterator ri;
@@ -905,7 +924,7 @@ int rdbLoadStreamIdmpEntries(rio *rdb, stream *s) {
 
     if (num_producers == 0) return 0;
 
-    uint64_t expire_time = server.mstime - (s->idmp_duration * 1000);
+    uint64_t expire_time = (rdb_thread_snapshot ? rdb_thread_now : server.mstime) - (s->idmp_duration * 1000);
 
     /* Create the producers rax tree. */
     s->idmp_producers = raxNewEx(0, &s->alloc_size, 0);
@@ -1258,7 +1277,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
         if (o->encoding == OBJ_ENCODING_TMPL_LP ||
             o->encoding == OBJ_ENCODING_TMPL_ARRAY) {
 
-            hashTemplate *tmpl = hashTypeGetTemplate(o);
+            hashTemplate *tmpl = rdb_thread_snapshot ? rdb_thread_template : hashTypeGetTemplate(o);
             unsigned long long field_count = tmpl->field_count;
 
             /* If this is a BGSAVE, we can use the compact ref format.
@@ -1687,8 +1706,18 @@ size_t rdbSavedObjectLen(robj *o, robj *key, int dbid) {
  * On error -1 is returned.
  * On success if the key was actually saved 1 is returned. */
 int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, int dbid) {
-    int savelru = server.maxmemory_policy & MAXMEMORY_FLAG_LRU;
-    int savelfu = server.maxmemory_policy & MAXMEMORY_FLAG_LFU;
+    long long idle = -1;
+    int frequency = -1;
+    if (server.maxmemory_policy & MAXMEMORY_FLAG_LRU)
+        idle = estimateObjectIdleTime(val) / 1000;
+    if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU)
+        frequency = LFUDecrAndReturn(val);
+    return rdbSaveKeyValuePairWithMetadata(rdb, key, val, expiretime, dbid, idle, frequency);
+}
+
+int rdbSaveKeyValuePairWithMetadata(rio *rdb, robj *key, robj *val,
+                                  long long expiretime, int dbid,
+                                  long long idle, int frequency) {
 
     /* Save the expire time */
     if (expiretime != -1) {
@@ -1697,17 +1726,15 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, in
     }
 
     /* Save the LRU info. */
-    if (savelru) {
-        uint64_t idletime = estimateObjectIdleTime(val);
-        idletime /= 1000; /* Using seconds is enough and requires less space.*/
+    if (idle >= 0) {
         if (rdbSaveType(rdb,RDB_OPCODE_IDLE) == -1) return -1;
-        if (rdbSaveLen(rdb,idletime) == -1) return -1;
+        if (rdbSaveLen(rdb,idle) == -1) return -1;
     }
 
     /* Save the LFU info. */
-    if (savelfu) {
+    if (frequency >= 0) {
         uint8_t buf[1];
-        buf[0] = LFUDecrAndReturn(val);
+        buf[0] = frequency;
         /* We can encode this in exactly two bytes: the opcode and an 8
          * bit counter, since the frequency is logarithmic with a 0-255 range.
          * Note that we do not store the halving time because to reset it
@@ -1717,7 +1744,7 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, in
     }
 
     /* if needed save key metadata  */
-    if (getModuleMetaBits(val->metabits)) {
+    if (getModuleMetaBits(kvobjMetaBits(val))) {
         if (rdbSaveKeyMetadata(rdb, key, val, dbid) == -1)
             return -1;
     }
@@ -1728,8 +1755,8 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, in
     if (rdbSaveObject(rdb,val,key,dbid) == -1) return -1;
 
     /* Delay return if required (for testing) */
-    if (server.rdb_key_save_delay)
-        debugDelay(server.rdb_key_save_delay);
+    long long delay = rdb_thread_snapshot ? rdb_thread_delay : server.rdb_key_save_delay;
+    if (delay) debugDelay(delay);
 
     return 1;
 }
@@ -1760,7 +1787,7 @@ ssize_t rdbSaveAuxFieldStrInt(rio *rdb, char *key, long long val) {
 }
 
 /* Save a few default AUX fields with information about the RDB generated. */
-int rdbSaveInfoAuxFields(rio *rdb, int rdbflags, rdbSaveInfo *rsi) {
+static int rdbSaveInfoAuxFields(rio *rdb, int rdbflags, rdbSaveInfo *rsi) {
     int redis_bits = (sizeof(void*) == 8) ? 64 : 32;
     int aof_base = (rdbflags & RDBFLAGS_AOF_PREAMBLE) != 0;
 
@@ -1968,16 +1995,27 @@ ssize_t rdbSaveDb(rio *rdb, int dbid, int rdbflags, long *key_counter, unsigned 
                 dismissDictBucketsMemory(kvstoreGetDict(db->keys, last_slot));
             last_slot = curr_slot;
         }
-        kvobj *kv = dictGetKV(de);
-        robj key;
-        long long expire;
-        size_t rdb_bytes_before_key = rdb->processed_bytes;
-
-        /* Skip keys that are being trimmed */
+        /* Apply keyspace exclusions before routing either kind of value. */
         if (server.cluster_enabled && isSlotInTrimJob(curr_slot)) {
             (*skipped)++;
             continue;
         }
+        if (server.in_fork_child && forklessSplitSaveActive() && dictEntryIsForkless(de)) {
+            /* Child frozen dict enumerates forkless keys for the parent
+             * serializer (pointer + dbid only; DONTFORK payloads stay in parent). */
+            if (forklessEmitWork(dictGetKV(de), dbid) != C_OK) goto werr2;
+            (*skipped)++;
+            continue;
+        }
+        kvobj *kv = dictGetKV(de);
+        /* Relaying helper frames may have selected a different database. */
+        if (server.in_fork_child && forklessSplitSaveActive()) {
+            if (rdbSaveType(rdb, RDB_OPCODE_SELECTDB) == -1 ||
+                rdbSaveLen(rdb, dbid) == -1) goto werr2;
+        }
+        robj key;
+        long long expire;
+        size_t rdb_bytes_before_key = rdb->processed_bytes;
 
         initStaticStringObject(key,kvobjGetKey(kv));
         expire = kvobjGetExpire(kv);
@@ -2008,6 +2046,11 @@ ssize_t rdbSaveDb(rio *rdb, int dbid, int rdbflags, long *key_counter, unsigned 
         }
     }
     kvstoreIteratorReset(&kvs_it);
+    /* No later RDB phase walks this database's key dictionary. Drop only
+     * bucket-array pages, not entries/objects which other phases may use.
+     * This also covers non-cluster databases and the final cluster slot. */
+    if (server.in_fork_child)
+        dismissDictBucketsMemory(kvstoreGetDict(db->keys, server.cluster_enabled ? last_slot : 0));
     return written;
 
 werr2:
@@ -2024,12 +2067,8 @@ werr:
  * When the function returns C_ERR and if 'error' is not NULL, the
  * integer pointed by 'error' is set to the value of errno just after the I/O
  * error. */
-int rdbSaveRio(int req, rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi) {
+int rdbSaveSnapshotPreamble(rio *rdb, int req, int rdbflags, rdbSaveInfo *rsi) {
     char magic[10];
-    uint64_t cksum;
-    long key_counter = 0;
-    unsigned long long skipped = 0;
-    int j;
 
     if (server.rdb_checksum)
         rdb->update_cksum = rioGenericUpdateChecksum;
@@ -2046,6 +2085,19 @@ int rdbSaveRio(int req, rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi) {
     if (!(req & SLAVE_REQ_RDB_EXCLUDE_DATA)) {
         if (rdbSaveHashTemplates(rdb) == -1) goto werr;
     }
+    return C_OK;
+werr:
+    return C_ERR;
+}
+
+int rdbSaveRio(int req, rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi) {
+    uint64_t cksum;
+    long key_counter = 0;
+    unsigned long long skipped = 0;
+    int j;
+    int split = server.in_fork_child && forklessSplitSaveActive();
+    if (split) forklessChildSetOutput(rdb);
+    if (rdbSaveSnapshotPreamble(rdb, req, rdbflags, rsi) == C_ERR) goto werr;
 
     /* save all databases, skip this if we're in functions-only mode */
     if (!(req & SLAVE_REQ_RDB_EXCLUDE_DATA)) {
@@ -2058,16 +2110,21 @@ int rdbSaveRio(int req, rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi) {
         }
     }
 
+    /* Drain the helper before module trailers, EOF and checksum, while this
+     * same rio still owns the file/socket and its running checksum. */
+    if (split && forklessChildFinishStream(rdb) == C_ERR) goto werr;
     if (!(req & SLAVE_REQ_RDB_EXCLUDE_DATA) && rdbSaveModulesAux(rdb, REDISMODULE_AUX_AFTER_RDB) == -1) goto werr;
 
     /* EOF opcode */
-    if (rdbSaveType(rdb,RDB_OPCODE_EOF) == -1) goto werr;
+    if (!(rdbflags & RDBFLAGS_NO_EOF)) {
+        if (rdbSaveType(rdb,RDB_OPCODE_EOF) == -1) goto werr;
 
-    /* CRC64 checksum. It will be zero if checksum computation is disabled, the
-     * loading code skips the check in this case. */
-    cksum = rdb->cksum;
-    memrev64ifbe(&cksum);
-    if (rioWrite(rdb,&cksum,8) == 0) goto werr;
+        /* CRC64 checksum. It will be zero if checksum computation is disabled, the
+         * loading code skips the check in this case. */
+        cksum = rdb->cksum;
+        memrev64ifbe(&cksum);
+        if (rioWrite(rdb,&cksum,8) == 0) goto werr;
+    }
     serverLog(LL_NOTICE, "BGSAVE done, %ld keys saved, %llu keys skipped, %zu bytes written.", key_counter, skipped, rdb->processed_bytes);
     return C_OK;
 
@@ -2101,6 +2158,39 @@ int rdbSaveRioWithEOFMark(int req, rio *rdb, int *error, rdbSaveInfo *rsi) {
 
 werr: /* Write error. */
     /* Set 'error' only if not already set by rdbSaveRio() call. */
+    if (error && *error == 0) *error = errno;
+    stopSaving(0);
+    return C_ERR;
+}
+
+/* Diskless replication for hybrid/forkless saves. The child writes
+ * fork-visible keys, and copies parent serializer bytes into the same rio
+ * as they arrive (extra SELECTDB is valid RDB). One footer after both. */
+static int rdbSaveRioWithEOFMarkForkless(int req, rio *rdb, int *error,
+                                        rdbSaveInfo *rsi)
+{
+    char eofmark[RDB_EOF_MARK_SIZE];
+    uint64_t cksum;
+
+    startSaving(RDBFLAGS_REPLICATION);
+    getRandomHexChars(eofmark,RDB_EOF_MARK_SIZE);
+    if (error) *error = 0;
+    forklessChildSetOutput(rdb);
+    if (rioWrite(rdb,"$EOF:",5) == 0) goto werr;
+    if (rioWrite(rdb,eofmark,RDB_EOF_MARK_SIZE) == 0) goto werr;
+    if (rioWrite(rdb,"\r\n",2) == 0) goto werr;
+    if (rdbSaveRio(req,rdb,error,
+                   RDBFLAGS_REPLICATION | RDBFLAGS_NO_EOF,rsi) == C_ERR)
+        goto werr;
+    if (rdbSaveType(rdb,RDB_OPCODE_EOF) == -1) goto werr;
+    cksum = rdb->cksum;
+    memrev64ifbe(&cksum);
+    if (rioWrite(rdb,&cksum,8) == 0) goto werr;
+    if (rioWrite(rdb,eofmark,RDB_EOF_MARK_SIZE) == 0) goto werr;
+    stopSaving(1);
+    return C_OK;
+
+werr:
     if (error && *error == 0) *error = errno;
     stopSaving(0);
     return C_ERR;
@@ -2182,6 +2272,17 @@ int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     char cwd[MAXPATHLEN]; /* Current working dir path for error messages. */
 
     startSaving(rdbflags);
+    if (server.in_fork_child && forklessSplitSaveActive() && forklessChildRdbTmpfile()) {
+        UNUSED(filename);
+        snprintf(tmpfile,256,"%s", forklessChildRdbTmpfile());
+        if (rdbSaveInternal(req,tmpfile,rsi,rdbflags) != C_OK) {
+            stopSaving(0);
+            return C_ERR;
+        }
+        /* The child produced the complete stream; parent installs it. */
+        stopSaving(1);
+        return C_OK;
+    }
     snprintf(tmpfile,256,"temp-%d.rdb", (int) getpid());
 
     if (rdbSaveInternal(req,tmpfile,rsi,rdbflags) != C_OK) {
@@ -2229,6 +2330,19 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     server.dirty_before_bgsave = server.dirty;
     server.lastbgsave_try = time(NULL);
 
+    if (server.bgsave_mode == BGSAVE_MODE_FORKLESS)
+        return forklessNoForkStart(req, filename, rsi, rdbflags, -1);
+
+    if (forklessEnabled()) {
+        char tmp[256];
+        snprintf(tmp, sizeof(tmp), "temp-forkless-%d.rdb", (int) getpid());
+        /* The child keeps a point-in-time key list in both new modes. */
+        if (forklessSaveBegin(tmp) != C_OK) {
+            server.lastbgsave_status = C_ERR;
+            return C_ERR;
+        }
+    }
+
     if ((childpid = redisFork(CHILD_TYPE_RDB)) == 0) {
         int retval;
 
@@ -2243,11 +2357,14 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     } else {
         /* Parent */
         if (childpid == -1) {
+            forklessSaveCleanup();
             server.lastbgsave_status = C_ERR;
             serverLog(LL_WARNING,"Can't save in background: fork: %s",
                 strerror(errno));
             return C_ERR;
         }
+        if (forklessEnabled() && forklessStartDiskSerializer() != C_OK)
+            serverLog(LL_WARNING, "Unable to start forkless background serializer");
         serverLog(LL_NOTICE,"Background saving started by pid %ld",(long) childpid);
         server.rdb_save_time_start = time(NULL);
         server.rdb_child_type = RDB_CHILD_TYPE_DISK;
@@ -5181,8 +5298,18 @@ int rdbLoadWithEmptyFunc(char *filename, rdbSaveInfo *rsi, int rdbflags, void (*
 
 /* A background saving child (BGSAVE) terminated its work. Handle this.
  * This function covers the case of actual BGSAVEs. */
-static void backgroundSaveDoneHandlerDisk(int exitcode, int bysignal, time_t save_end) {
+static int backgroundSaveDoneHandlerDisk(int exitcode, int bysignal, time_t save_end) {
     if (!bysignal && exitcode == 0) {
+        if (forklessEnabled() && forklessChildRdbTmpfile()) {
+            if (forklessParentInstallRdb(forklessChildRdbTmpfile(),
+                                         server.rdb_filename) != C_OK)
+            {
+                serverLog(LL_WARNING, "Background saving error (forkless merge)");
+                server.lastbgsave_status = C_ERR;
+                server.stat_rdb_consecutive_failures++;
+                return C_ERR;
+            }
+        }
         serverLog(LL_NOTICE,
             "Background saving terminated with success");
         server.dirty = server.dirty - server.dirty_before_bgsave;
@@ -5193,6 +5320,7 @@ static void backgroundSaveDoneHandlerDisk(int exitcode, int bysignal, time_t sav
         serverLog(LL_WARNING, "Background saving error");
         server.lastbgsave_status = C_ERR;
         server.stat_rdb_consecutive_failures++;
+        forklessSaveCleanup();
     } else {
         mstime_t latency;
 
@@ -5208,7 +5336,9 @@ static void backgroundSaveDoneHandlerDisk(int exitcode, int bysignal, time_t sav
             server.lastbgsave_status = C_ERR;
             server.stat_rdb_consecutive_failures++;
         }
+        forklessSaveCleanup();
     }
+    return (!bysignal && exitcode == 0) ? C_OK : C_ERR;
 }
 
 /* A background saving child (BGSAVE) terminated its work. Handle this.
@@ -5239,6 +5369,7 @@ static void backgroundSaveDoneHandlerSocket(int exitcode, int bysignal) {
     zfree(server.rdb_pipe_buff);
     server.rdb_pipe_buff = NULL;
     server.rdb_pipe_bufflen = 0;
+    forklessSaveCleanup();
 }
 
 /* When a background RDB saving/transfer terminates, call the right handler. */
@@ -5249,7 +5380,8 @@ void backgroundSaveDoneHandler(int exitcode, int bysignal) {
         bysignal = SIGUSR1;
     switch(server.rdb_child_type) {
     case RDB_CHILD_TYPE_DISK:
-        backgroundSaveDoneHandlerDisk(exitcode,bysignal,save_end);
+        if (backgroundSaveDoneHandlerDisk(exitcode,bysignal,save_end) != C_OK)
+            exitcode = 1;
         break;
     case RDB_CHILD_TYPE_SOCKET:
         backgroundSaveDoneHandlerSocket(exitcode,bysignal);
@@ -5272,6 +5404,12 @@ void backgroundSaveDoneHandler(int exitcode, int bysignal) {
  * the child did not exit for an error, but because we wanted), and performs
  * the cleanup needed. */
 void killRDBChild(void) {
+    if (forklessNoForkActive()) {
+        forklessNoForkCancel();
+        server.bgsave_aborted = 1;
+        return;
+    }
+    if (server.child_pid <= 0) return;
     kill(server.child_pid, SIGUSR1);
     /* Because we are not using here waitpid (like we have in killAppendOnlyChild
      * and TerminateModuleForkChild), all the cleanup operations is done by
@@ -5296,8 +5434,26 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
     int pipefds[2], rdb_pipe_write = 0, safe_to_exit_pipe = 0;
     int rdb_channel = server.repl_rdb_channel && (req & SLAVE_REQ_RDB_CHANNEL);
     int slots_req = req & SLAVE_REQ_SLOTS_SNAPSHOT;
+    int nofork_socket = server.bgsave_mode == BGSAVE_MODE_FORKLESS;
+    int forkless_socket = server.bgsave_mode == BGSAVE_MODE_HYBRID && forklessEnabled() &&
+                          !(req & SLAVE_REQ_RDB_EXCLUDE_DATA);
+    /* Keep forkless serialization and all TLS/socket I/O in the parent.
+     * Dedicated RDB-channel requests can use the existing parent relay just
+     * like ordinary diskless full syncs. */
+    if (forkless_socket || nofork_socket) rdb_channel = 0;
 
     if (hasActiveChildProcess()) return C_ERR;
+    /* The split stream currently supports normal replica full syncs. RDB
+     * channel/slot snapshots have a different direct-socket lifecycle, and
+     * no-compress would require a thread-local compression setting. */
+    if (((forkless_socket || nofork_socket) && slots_req) ||
+        (forkless_socket && (req & SLAVE_REQ_RDB_NO_COMPRESS)))
+    {
+        serverLog(LL_WARNING,
+            "This diskless replication request is not supported with bgsave-mode %s",
+            bgsaveModeName());
+        return C_ERR;
+    }
 
     /* Even if the previous fork child exited, don't start a new one until we
      * drained the pipe. */
@@ -5321,6 +5477,21 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
         }
         safe_to_exit_pipe = pipefds[0]; /* read end */
         server.rdb_child_exit_pipe = pipefds[1]; /* write end */
+    }
+
+    if (forkless_socket) {
+        if (forklessSaveBegin(NULL) != C_OK) {
+            forklessSaveCleanup();
+            if (!rdb_channel) {
+                close(rdb_pipe_write);
+                close(server.rdb_pipe_read);
+                close(server.rdb_child_exit_pipe);
+                close(safe_to_exit_pipe);
+                server.rdb_pipe_read = -1;
+                server.rdb_child_exit_pipe = -1;
+            }
+            return C_ERR;
+        }
     }
 
     /* Collect the connections of the replicas we want to transfer
@@ -5348,6 +5519,34 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
         server.rdb_pipe_conns = conns;
         server.rdb_pipe_numconns = numconns;
         server.rdb_pipe_numconns_writing = 0;
+    }
+
+    if (nofork_socket) {
+        /* The worker owns the output descriptor only after a successful
+         * start. The ordinary parent relay still owns all socket/TLS I/O.
+         * Its EOF closes rdb_child_exit_pipe, the completion barrier also
+         * used by forklessNoForkCron. No child or waitpid is involved. */
+        int result = forklessNoForkStart(req, NULL, rsi, RDBFLAGS_REPLICATION, rdb_pipe_write);
+        close(safe_to_exit_pipe);
+        if (result != C_OK) {
+            close(rdb_pipe_write);
+            close(server.rdb_pipe_read);
+            close(server.rdb_child_exit_pipe);
+            server.rdb_pipe_read = server.rdb_child_exit_pipe = -1;
+            zfree(server.rdb_pipe_conns);
+            server.rdb_pipe_conns = NULL;
+            server.rdb_pipe_numconns = server.rdb_pipe_numconns_writing = 0;
+            listRewind(server.slaves, &li);
+            while ((ln = listNext(&li))) {
+                client *slave = ln->value;
+                if (slave->replstate == SLAVE_STATE_WAIT_BGSAVE_END && slave->slave_req == req)
+                    slave->replstate = SLAVE_STATE_WAIT_BGSAVE_START;
+            }
+            return C_ERR;
+        }
+        if (aeCreateFileEvent(server.el, server.rdb_pipe_read, AE_READABLE, rdbPipeReadHandler, NULL) == AE_ERR)
+            serverPanic("Unrecoverable error creating server.rdb_pipe_read file event.");
+        return C_OK;
     }
 
     /* Create the child process. */
@@ -5378,6 +5577,8 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
         if (req & SLAVE_REQ_SLOTS_SNAPSHOT) {
             /* Slots snapshot is required */
             retval = slotSnapshotSaveRio(req, &rdb, NULL);
+        } else if (forkless_socket) {
+            retval = rdbSaveRioWithEOFMarkForkless(req,&rdb,NULL,rsi);
         } else {
             retval = rdbSaveRioWithEOFMark(req,&rdb,NULL,rsi);
         }
@@ -5406,6 +5607,7 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
     } else {
         /* Parent */
         if (childpid == -1) {
+            if (forkless_socket) forklessSaveCleanup();
             serverLog(LL_WARNING,"Can't save in background: fork: %s",
                 strerror(errno));
 
@@ -5430,6 +5632,9 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
                 server.rdb_pipe_numconns_writing = 0;
             }
         } else {
+            if (forkless_socket && forklessStartSocketSerializer() != C_OK)
+                serverLog(LL_WARNING,
+                          "Unable to start forkless diskless serializer");
             serverLog(LL_NOTICE, "Background RDB transfer started by pid %ld to %s", (long)childpid,
                 rdb_channel ? (slots_req ? "slot migration destination socket" : "replica socket") :
                               "parent process pipe");

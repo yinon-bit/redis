@@ -7,6 +7,17 @@
 
 static redisAtomic size_t lazyfree_objects = 0;
 static redisAtomic size_t lazyfreed_objects = 0;
+/* Whole-dictionary frees may decrement strings also retained by snapshots.
+ * Main publishes a job before BIO can start, and defers snapshot reference
+ * release until all such jobs finish. Ordinary per-object jobs require an
+ * exclusive reference and do not need this barrier. */
+static redisAtomic size_t lazyfree_db_jobs = 0;
+
+int lazyfreeHasPendingDbJobs(void) {
+    size_t jobs;
+    atomicGetWithSync(lazyfree_db_jobs, jobs);
+    return jobs != 0;
+}
 
 /* Release objects from the lazyfree thread. It's just decrRefCount()
  * updating the count of objects to release. */
@@ -47,6 +58,8 @@ static void lazyfreeFreeKvs(void *args[]) {
 
     jemalloc_purge();
 #endif
+    /* Publish all non-atomic object decrements before main releases its refs. */
+    atomicDecrRelease(lazyfree_db_jobs, 1);
 }
 
 /* Release the key tracking table. */
@@ -320,6 +333,7 @@ void emptyDbDataAsync(kvstore *keys, kvstore *expires, ebuckets hexpires,
     serverAssert(callback || userdata == NULL);
 
     atomicIncr(lazyfree_objects, kvstoreSize(keys));
+    atomicIncr(lazyfree_db_jobs, 1);
     bioCreateLazyFreeJob(lazyfreeFreeKvs, 6, keys, expires, hexpires, stream_idmp_keys,
                          (void *)(uintptr_t)callback, userdata);
 }

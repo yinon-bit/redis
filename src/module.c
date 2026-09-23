@@ -37,6 +37,7 @@
  * -------------------------------------------------------------------------- */
 
 #include "server.h"
+#include "forkless.h"
 #include "cluster.h"
 #include "cluster_asm.h"
 #include "slowlog.h"
@@ -5793,6 +5794,7 @@ int RM_HashSet(RedisModuleKey *key, int flags, ...) {
             oldsize = kvobjAllocSize(key->kv);
         hashTypeTryConversion(key->db,key->kv,argv,0,1);
         int updated = hashTypeSet(key->db, key->kv, field->ptr, value->ptr, low_flags);
+        key->kv = forklessFinalizeHashValue(key->db, key->key, key->kv);
         if (server.memory_tracking_enabled)
             updateSlotAllocSize(key->db, getKeySlot(key->key->ptr), key->kv, oldsize, kvobjAllocSize(key->kv));
         count += (flags & REDISMODULE_HASH_COUNT_ALL) ? 1 : updated;
@@ -15104,6 +15106,8 @@ size_t moduleCount(void) {
 int RM_SetLRU(RedisModuleKey *key, mstime_t lru_idle) {
     if (!key->kv)
         return REDISMODULE_ERR;
+    if (!(server.maxmemory_policy & MAXMEMORY_FLAG_LFU) && lru_idle >= 0)
+        forklessCaptureMetadata(key->db, key->kv);
     if (objectSetLRUOrLFU(key->kv, -1, lru_idle, lru_idle>=0 ? LRU_CLOCK() : 0, 1))
         return REDISMODULE_OK;
     return REDISMODULE_ERR;
@@ -15131,6 +15135,8 @@ int RM_GetLRU(RedisModuleKey *key, mstime_t *lru_idle) {
 int RM_SetLFU(RedisModuleKey *key, long long lfu_freq) {
     if (!key->kv)
         return REDISMODULE_ERR;
+    if ((server.maxmemory_policy & MAXMEMORY_FLAG_LFU) && lfu_freq >= 0)
+        forklessCaptureMetadata(key->db, key->kv);
     if (objectSetLRUOrLFU(key->kv, lfu_freq, -1, 0, 1))
         return REDISMODULE_OK;
     return REDISMODULE_ERR;

@@ -44,6 +44,7 @@
  */
 
 #include "server.h"
+#include "forkless.h"
 #include "cluster.h"
 #include "functions.h"
 #include "cluster_asm.h"
@@ -3139,6 +3140,10 @@ static void asmBackgroundTrimDoneCB(uint64_t client_id, void *userdata) {
  * detached data, followed by a completion request that notifies the main thread
  * to apply the deltas, reply to the client if needed. */
 static void asmTriggerBackgroundTrim(asmTrimJob *job) {
+    /* Hybrid work records also contain parent addresses. Stop both split-save
+     * paths before bulk removal bypasses per-key mutation capture. Classic
+     * fork snapshots own their pages and this call is a no-op for them. */
+    forklessAbortBeforeFlush();
     /* Allocate histogram tracking state only for background trim. */
     serverAssert(job && job->bg == NULL);
     job->bg = zcalloc(sizeof(*job->bg));

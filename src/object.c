@@ -24,8 +24,10 @@
 
 /* Map a metadata ID (bit index) to its compacted slot number among set bits,
  * then return a pointer to that slot. Caller must ensure the ID bit is set. */
+_Static_assert(OBJ_NUM_KVMETA_BITS == KEY_META_ID_MAX, "Metadata masks must match the header");
 uint64_t *kvobjMetaRef(kvobj *kv, int metaId) {
-    uint32_t bits = kv->metabits;
+    serverAssert(metaId >= 0 && metaId < KEY_META_ID_MAX);
+    uint32_t bits = kvobjMetaBits(kv);
 
     /* Expiry is always the first metadata */
     if (likely(metaId == 0)) return ((uint64_t *)kv) - 1;
@@ -60,6 +62,7 @@ uint64_t *kvobjMetaRef(kvobj *kv, int metaId) {
  *                              kvobjCreate() returns pointer to here
  */
 kvobj *kvobjCreate(int type, const sds key, void *ptr, uint32_t keyMetaBits) {
+    serverAssert((keyMetaBits & ~KEY_META_MASK_ALL) == 0);
     /* Determine embedded key and expiration flags */
     serverAssert(key != NULL);
 
@@ -89,7 +92,7 @@ kvobj *kvobjCreate(int type, const sds key, void *ptr, uint32_t keyMetaBits) {
     kv->refcount = 1;
     kv->lru = 0;
     kv->iskvobj = 1;
-    kv->metabits = keyMetaBits;
+    kv->kvflags = keyMetaBits;
 
     /* The memory after the struct where we embedded data. */
     char *data = (void *)(kv + 1);
@@ -112,7 +115,7 @@ robj *createObject(int type, void *ptr) {
     o->refcount = 1;
     o->lru = 0;
     o->iskvobj = 0;
-    o->metabits = 0;
+    o->kvflags = 0;
     return o;
 }
 
@@ -163,6 +166,7 @@ robj *createRawStringObject(const char *ptr, size_t len) {
 static kvobj *kvobjCreateEmbedString(const char *val_ptr, size_t val_len,
                                      const sds key, uint32_t keyMetaBits)
 {
+    serverAssert((keyMetaBits & ~KEY_META_MASK_ALL) == 0);
     kvobj *o;
     debugServerAssert(key != NULL);
     uint32_t sizeMetas = getNumMeta(keyMetaBits) * sizeof(uint64_t);
@@ -189,7 +193,7 @@ static kvobj *kvobjCreateEmbedString(const char *val_ptr, size_t val_len,
     o->encoding = OBJ_ENCODING_EMBSTR;
     o->refcount = 1;
     o->lru = 0;
-    o->metabits = keyMetaBits;
+    o->kvflags = keyMetaBits;
     o->iskvobj = 1;
 
     /* The memory after the struct where we embedded data. */
@@ -229,7 +233,7 @@ static inline robj *createEmbeddedStringObject(const char *val_ptr, size_t val_l
     o->encoding = OBJ_ENCODING_EMBSTR;
     o->refcount = 1;
     o->lru = 0;
-    o->metabits = 0;
+    o->kvflags = 0;
     o->iskvobj = 0;
 
     /* The memory after the struct where we embedded data. */
@@ -251,7 +255,7 @@ sds kvobjGetKey(const kvobj *kv) {
 }
 
 long long kvobjGetExpire(const kvobj *kv) {
-    if (kv->metabits & KEY_META_MASK_EXPIRE) {
+    if (kvobjMetaBits(kv) & KEY_META_MASK_EXPIRE) {
         return (long long) (*kvobjMetaRef((kvobj *)kv, KEY_META_ID_EXPIRE));
     } else {
         return -1;
@@ -263,12 +267,12 @@ long long kvobjGetExpire(const kvobj *kv) {
  * returned object instead of 'val' after calling this function. */
 kvobj *kvobjSetExpire(kvobj *kv, long long expire) {
     /* If kv not expirable, then we need to realloc to add expire metadata */ 
-    if (!(kv->metabits & KEY_META_MASK_EXPIRE)) {
+    if (!(kvobjMetaBits(kv) & KEY_META_MASK_EXPIRE)) {
         /* Nothing to do if kv not expirable and expire is -1 */
         if (expire == -1)
             return kv;
         
-        kv = kvobjSet(kvobjGetKey(kv), kv, kv->metabits | KEY_META_MASK_EXPIRE);
+        kv = kvobjSet(kvobjGetKey(kv), kv, kvobjMetaBits(kv) | KEY_META_MASK_EXPIRE);
     }
 
     /* kv is expirable. Update expire field. */
@@ -319,9 +323,12 @@ kvobj *kvobjSet(sds key, robj *val, uint32_t keyMetaBits) {
     }
     
     kv->lru = val->lru;
+    /* Metadata/expiry relocation must not discard the source object's mark.
+     * Fresh values start unmarked; these bits are never persisted to RDB. */
+    kvobjSetSnapshot(kv, val->iskvobj ? kvobjSnapshot(val) : 0);
 
     /* Transfer module metadata from `val` to new `kv` (if `val` of type kvobj with metadata). */
-    if (val->metabits & KEY_META_MASK_MODULES)
+    if (kvobjMetaBits(val) & KEY_META_MASK_MODULES)
         keyMetaTransition((kvobj *) val, kv);
     
     decrRefCount(val);
@@ -540,10 +547,21 @@ robj *createArrayObject(void) {
     return o;
 }
 
+/* Count payloads, not object headers: kvobj conversion transfers ownership.
+ * Lazy freeing may destroy a payload off the main thread. */
+static redisAtomic size_t module_payload_count = 0;
+
+size_t moduleObjectCount(void) {
+    size_t count;
+    atomicGet(module_payload_count, count);
+    return count;
+}
+
 robj *createModuleObject(moduleType *mt, void *value) {
     moduleValue *mv = zmalloc(sizeof(*mv));
     mv->type = mt;
     mv->value = value;
+    atomicIncr(module_payload_count, 1);
     return createObject(OBJ_MODULE,mv);
 }
 
@@ -606,6 +624,7 @@ void freeModuleObject(robj *o) {
     moduleValue *mv = o->ptr;
     mv->type->free(mv->value);
     zfree(mv);
+    atomicDecr(module_payload_count, 1);
 }
 
 void freeStreamObject(robj *o) {
@@ -664,7 +683,7 @@ void decrRefCount(robj *o) {
             /* eval real allocation pointer */
             alloc = kvobjGetAllocPtr(o);
             /* if kvobj has metadata attached. */
-            if (getModuleMetaBits(o->metabits))
+            if (getModuleMetaBits(kvobjMetaBits(o)))
                 keyMetaOnFree((kvobj *)o);
         }
         
@@ -1354,7 +1373,7 @@ size_t kvobjAllocSize(kvobj *o) {
     debugServerAssert(o->iskvobj);
     size_t asize = sizeof(kvobj);
     /* Add metadata size */
-    asize += getNumMeta(o->metabits) * sizeof(uint64_t);
+    asize += getNumMeta(kvobjMetaBits(o)) * sizeof(uint64_t);
     /* Add embedded key size */
     asize += 1; /* embedded key header size */
     asize += sdsAllocSize(kvobjGetKey(o));

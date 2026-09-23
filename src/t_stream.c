@@ -8,6 +8,7 @@
  */
 
 #include "server.h"
+#include "forkless.h"
 #include "endianconv.h"
 #include "stream.h"
 #include "xxhash.h"
@@ -6291,6 +6292,7 @@ void handleExpiredIdmpEntries(void) {
             }
 
             /* Iterate through all producers and remove expired entries */
+            if (forklessNoForkActive()) forklessCaptureMetadata(db, kv);
             int modified = 0;
             raxIterator ri;
             raxStart(&ri, s->idmp_producers);

@@ -159,7 +159,17 @@ void* activeDefragAllocWithoutFree(void *ptr) {
      * make sure not to use the thread cache. so that we don't get back the same
      * pointers we try to free */
     size = zmalloc_usable_size(ptr);
+#if defined(USE_JEMALLOC)
+    {
+        int flags = MALLOCX_TCACHE_NONE;
+        int arena = zmallocPtrArenaIndex(ptr);
+        if (arena >= 0)
+            flags |= MALLOCX_ARENA(arena);
+        newptr = zmalloc_with_flags(size, flags);
+    }
+#else
     newptr = zmalloc_no_tcache(size);
+#endif
     memcpy(newptr, ptr, size);
     server.stat_active_defrag_hits++;
     return newptr;

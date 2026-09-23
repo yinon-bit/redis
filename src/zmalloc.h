@@ -131,8 +131,14 @@ size_t zmalloc_get_smap_bytes_by_field(char *field, long pid);
 size_t zmalloc_get_memory_size(void);
 void zlibc_free(void *ptr);
 void zmadvise_dontneed(void *ptr);
+int zmallocPtrArenaIndex(void *ptr);
+/* Register an extent whose memory must never enter a shared thread cache.
+ * Must be called before the memory is handed out. See zmalloc.c for why. */
+void zmallocNoTcacheWindowAdd(void *addr, size_t size);
 
 #if defined(USE_JEMALLOC)
+void zmalloc_set_thread_flags(int flags);
+int zmalloc_get_thread_flags(void);
 void *zmalloc_with_flags(size_t size, int flags);
 void *zrealloc_with_flags(void *ptr, size_t size, int flags);
 void zfree_with_flags(void *ptr, int flags);

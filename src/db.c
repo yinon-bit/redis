@@ -13,6 +13,7 @@
  */
 
 #include "server.h"
+#include "forkless.h"
 #include "vector.h"
 #include "cluster.h"
 #include "atomicvar.h"
@@ -57,10 +58,11 @@ void updateLFU(robj *val) {
 }
 
 /* Update LRM when an object is modified. */
-void updateLRM(robj *o) {
+static void updateLRM(redisDb *db, robj *o) {
     if (o->refcount == OBJ_SHARED_REFCOUNT)
         return;
     if (server.maxmemory_policy & MAXMEMORY_FLAG_LRM) {
+        forklessCaptureMetadata(db, o);
         o->lru = LRU_CLOCK();
     }
 }
@@ -294,8 +296,9 @@ void dbgRunAssertions(redisDb *db) {
  * expired on replicas even if the master is lagging expiring our key via DELs
  * in the replication link. */
 kvobj *lookupKey(redisDb *db, robj *key, int flags, dictEntryLink *link) {
-
-    kvobj *val = dbFindByLink(db, key->ptr, link);
+    dictEntryLink capture_link = NULL;
+    dictEntryLink *plink = link ? link : &capture_link;
+    kvobj *val = dbFindByLink(db, key->ptr, plink);
 
     if (val) {
         /* Forcing deletion of expired keys on a replica makes the replica
@@ -342,6 +345,13 @@ kvobj *lookupKey(redisDb *db, robj *key, int flags, dictEntryLink *link) {
 
         if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE)))
             server.stat_keyspace_hits++;
+        /* Some writers (notably XREADGROUP/XCLAIM) deliberately use read
+         * lookups. Use the executing command, including nested script/module
+         * calls, rather than the outer network client's command. */
+        int snapshot_write = forklessNoForkActive() && server.executing_client &&
+                             server.executing_client->cmd && (server.executing_client->cmd->flags & CMD_WRITE);
+        if (((flags & LOOKUP_WRITE) || snapshot_write) && !(flags & LOOKUP_REPLACE) && *plink)
+            forklessCaptureFromLink(db, *plink);
         /* TODO: Use separate hits stats for WRITE */
     } else {
         if (!(flags & (LOOKUP_NONOTIFY | LOOKUP_WRITE)))
@@ -438,10 +448,10 @@ kvobj *dbAddInternal(redisDb *db, robj *key, robj **valref, dictEntryLink *link,
     dictEntryLink tmp = NULL;
     if (link == NULL) link = &tmp;
     robj *val = *valref;
-    kvobj *kv = kvobjSet(key->ptr, val, keymeta->metabits);
+    kvobj *kv = forklessCreateKvobj(key->ptr, val, keymeta->metabits);
     initObjectLRUOrLFU(kv);
     kvstoreDictSetAtLink(db->keys, slot, kv, link, 1);
-    
+
     /* Handle metadata (expiration and modules metadata) */
     if (keymeta->metabits) {
         if (keymeta->metabits & KEY_META_MASK_EXPIRE) {
@@ -458,6 +468,7 @@ kvobj *dbAddInternal(redisDb *db, robj *key, robj **valref, dictEntryLink *link,
                    keymeta->meta + KEY_META_ID_MAX - keymeta->numMeta, 
                    keymeta->numMeta * sizeof(uint64_t));
     }
+    forklessFinalizeDbValue(db, key, &kv, *link);
 
     signalKeyAsReady(db, key, kv->type);
     notifyKeyspaceEvent(NOTIFY_NEW,"new",key,db->id);
@@ -546,7 +557,7 @@ kvobj *dbAddRDBLoad(redisDb *db, sds key, robj **valref, const KeyMetaSpec *keyM
 
     /* Create kvobj with metadata bits from KeyMetaSpec */
     robj *val = *valref;
-    kvobj *kv = kvobjSet(key, val, keyMetaSpec->metabits);
+    kvobj *kv = forklessCreateKvobj(key, val, keyMetaSpec->metabits);
     initObjectLRUOrLFU(kv);
     kvstoreDictSetAtLink(db->keys, slot, kv, &bucket, 1);
 
@@ -565,6 +576,9 @@ kvobj *dbAddRDBLoad(redisDb *db, sds key, robj **valref, const KeyMetaSpec *keyM
                    keyMetaSpec->meta + KEY_META_ID_MAX - keyMetaSpec->numMeta,
                    keyMetaSpec->numMeta * sizeof(uint64_t));
     }
+    robj keyobj;
+    initStaticStringObject(keyobj, key);
+    forklessFinalizeDbValue(db, &keyobj, &kv, bucket);
 
     updateKeysizesHist(db, kv->type, -1, (int64_t) getObjectLength(kv));
     if (server.memory_tracking_enabled)
@@ -601,6 +615,21 @@ static void dbSetValue(redisDb *db, robj *key, robj **valref, dictEntryLink link
         serverAssertWithInfo(NULL, key, link != NULL); /* expected to exist */
     }
     kvobj *old = dictGetKV(*link);
+    /* For larger strings, retain instead of copying the old payload. Small
+     * RAW strings keep the copy path: a retained reference would prevent the
+     * header-swap fast path below, trading a cheap memcpy for extra key/object
+     * allocations. In-place updates always require ordinary capture. */
+    /* Crossing the hybrid cap needs a new fork-owned allocation anyway.
+     * Retain the small original for the snapshot instead of copying it and
+     * then migrating the reused header. The new value is routed at creation. */
+    int crosses_forkless_cap = server.bgsave_mode == BGSAVE_MODE_HYBRID &&
+        old->type == OBJ_STRING && val->type == OBJ_STRING &&
+        stringObjectLen(old) <= server.forkless_string_max &&
+        stringObjectLen(val) > server.forkless_string_max;
+    if (overwrite && old->type == OBJ_STRING &&
+        (stringObjectLen(old) >= 4096 || crosses_forkless_cap))
+        forklessCaptureForUnlink(db, link);
+    else forklessCaptureFromLink(db, link);
     kvobj *kvNew;
 
     int64_t oldlen = (int64_t) getObjectLength(old);
@@ -617,7 +646,7 @@ static void dbSetValue(redisDb *db, robj *key, robj **valref, dictEntryLink link
     long long oldExpire = getExpire(db, key->ptr, old);
 
     /* All metadata will be kept if not `overwrite` for the new object  */
-    uint32_t newKeyMetaBits = old->metabits;
+    uint32_t newKeyMetaBits = kvobjMetaBits(old);
     /* clear expire if not keepTTL or no old expire */
     if ((!keepTTL) || (oldExpire == -1))
         newKeyMetaBits &= ~KEY_META_MASK_EXPIRE; 
@@ -630,7 +659,7 @@ static void dbSetValue(redisDb *db, robj *key, robj **valref, dictEntryLink link
         incrRefCount(old);
 
         /* Free related metadata. Ignore builtin metadata (currently only expire) */
-        if (getModuleMetaBits(old->metabits)) {
+        if (getModuleMetaBits(kvobjMetaBits(old))) {
             keyMetaOnUnlink(db, key, old);
             freeModuleMeta = 1;
         }
@@ -670,8 +699,8 @@ static void dbSetValue(redisDb *db, robj *key, robj **valref, dictEntryLink link
     } else {
         /* Replace the old value at its location in the key space. */
         val->lru = old->lru;
-        
-        kvNew = kvobjSet(key->ptr, val, newKeyMetaBits);
+
+        kvNew = forklessCreateKvobj(key->ptr, val, newKeyMetaBits);
         kvstoreDictSetAtLink(db->keys, slot, kvNew, &link, 0);
 
         /* if expiry replace the old value at its location in the expire space. */
@@ -725,6 +754,7 @@ static void dbSetValue(redisDb *db, robj *key, robj **valref, dictEntryLink link
     } else {
         decrRefCount(old);
     }
+    forklessFinalizeDbValue(db, key, &kvNew, link);
     *valref = kvNew;
 }
 
@@ -877,6 +907,8 @@ int dbGenericDelete(redisDb *db, robj *key, int async, int flags) {
 
     if (link) {
         kvobj *kv = dictGetKV(*link);
+        forklessCaptureForUnlink(db, link);
+        if (flags & DB_FLAG_KEY_EVICTED) forklessPrioritizeEviction(kv);
 
         int64_t oldlen = (int64_t) getObjectLength(kv);
         int type = kv->type;
@@ -893,7 +925,7 @@ int dbGenericDelete(redisDb *db, robj *key, int async, int flags) {
          * need to incr to retain kv */
         incrRefCount(kv); /* refcnt=1->2 */
         /* Metadata hook: notify unlink for key metadata cleanup. */
-        if (getModuleMetaBits(kv->metabits)) keyMetaOnUnlink(db, key, kv);
+        if (getModuleMetaBits(kvobjMetaBits(kv))) keyMetaOnUnlink(db, key, kv);
         /* Tells the module that the key has been unlinked from the database. */
         moduleNotifyKeyUnlink(key, kv, db->id, flags);
         /* We want to try to unblock any module clients or clients using a blocking XREADGROUP */
@@ -990,6 +1022,10 @@ kvobj *dbUnshareStringValue(redisDb *db, robj *key, kvobj *kv) {
  * which can be used if we already have one, thus saving the dbFind call. */
 kvobj *dbUnshareStringValueByLink(redisDb *db, robj *key, kvobj *o, dictEntryLink link) {
     serverAssert(o->type == OBJ_STRING);
+    /* Read-only commands such as PFCOUNT may update a string's cached bytes.
+     * Preserve even an already-unshared RAW value before returning it. */
+    if (link) forklessCaptureFromLink(db, link);
+    else forklessCaptureMetadata(db, o);
     if (o->refcount != 1 || o->encoding != OBJ_ENCODING_RAW) {
         robj *decoded = getDecodedObject(o);
         o = createRawStringObject(decoded->ptr, sdslen(decoded->ptr));
@@ -1008,6 +1044,7 @@ kvobj *dbUnshareStringValueByLink(redisDb *db, robj *key, kvobj *o, dictEntryLin
 long long emptyDbStructure(redisDb *dbarray, int dbnum, int async,
                            void(callback)(dict*))
 {
+    if (dbarray == server.db) forklessAbortBeforeFlush();
     long long removed = 0;
     int startdb, enddb;
 
@@ -1205,7 +1242,7 @@ long long dbTotalServerKeyCount(void) {
  * - signal: if true, trigger WATCH and client-side tracking invalidation
  */
 void keyModified(client *c, redisDb *db, robj *key, robj *val, int signal) {
-    if (val) updateLRM(val);
+    if (val) updateLRM(db, val);
     if (signal) {
         touchWatchedKey(db,key);
         trackingInvalidateKey(c,key,1);
@@ -2286,7 +2323,7 @@ void renameGenericCommand(client *c, int nx) {
     /* Prepare metadata for the renamed key */
     KeyMetaSpec keymeta;
     keyMetaSpecInit(&keymeta);
-    if (o->metabits) keyMetaOnRename(c->db, o, c->argv[1], c->argv[2], &keymeta);
+    if (kvobjMetaBits(o)) keyMetaOnRename(c->db, o, c->argv[1], c->argv[2], &keymeta);
 
     dbDelete(c->db,c->argv[1]);
     
@@ -2511,7 +2548,7 @@ void copyCommand(client *c) {
     /* Prepare metadata for the new key */
     KeyMetaSpec keymeta;
     keyMetaSpecInit(&keymeta);
-    if (o->metabits) keyMetaOnCopy(o, key, newkey, c->db->id, dst->id, &keymeta);
+    if (kvobjMetaBits(o)) keyMetaOnCopy(o, key, newkey, c->db->id, dst->id, &keymeta);
 
     kvobj *kvCopy = dbAddInternal(dst, newkey, &newobj, NULL, &keymeta);
 
@@ -2653,6 +2690,7 @@ int dbSwapDatabases(int id1, int id2) {
  * database (temp) as the main (active) database, the actual freeing of old database
  * (which will now be placed in the temp one) is done later. */
 void swapMainDbWithTempDb(redisDb *tempDb) {
+    if (forklessNoForkActive()) forklessAbortBeforeFlush();
     for (int i=0; i<server.dbnum; i++) {
         redisDb aux = server.db[i];
         redisDb *activedb = &server.db[i], *newdb = &tempDb[i];
@@ -2740,6 +2778,9 @@ void swapdbCommand(client *c) {
 int removeExpire(redisDb *db, robj *key) {
     int table;
     int slot = getKeySlot(key->ptr);
+    dictEntryLink keyLink = kvstoreDictFindLink(db->keys, slot, key->ptr, NULL);
+    if (keyLink) forklessCaptureFromLink(db, keyLink);
+
     dictEntryLink link = kvstoreDictTwoPhaseUnlinkFind(db->expires, slot, key->ptr, &table);
 
     if (link == NULL) return 0;
@@ -2772,6 +2813,7 @@ kvobj *setExpireByLink(client *c, redisDb *db, sds key, long long when, dictEntr
         serverAssert(keyLink != NULL);
     }
     kvobj *kv = dictGetKV(*keyLink);
+    forklessCaptureFromLink(db, keyLink);
     long long old_when = kvobjGetExpire(kv);
 
     if (old_when != -1) { /* old expire */

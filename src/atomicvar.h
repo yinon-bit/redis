@@ -7,6 +7,7 @@
  * atomicGetIncr(var,oldvalue_var,count) -- Get and increment the atomic counter
  * atomicIncrGet(var,newvalue_var,count) -- Increment and get the atomic counter new value
  * atomicDecr(var,count) -- Decrement the atomic counter
+ * atomicDecrRelease(var,count) -- Decrement with release ordering
  * atomicGet(var,dstvar) -- Fetch the atomic counter value
  * atomicSet(var,value)  -- Set the atomic counter value
  * atomicGetWithSync(var,value)  -- 'atomicGet' with inter-thread synchronization
@@ -104,6 +105,7 @@
 #define atomicIncrGet(var, newvalue_var, count) \
     newvalue_var = atomicIncr(var,count) + count
 #define atomicDecr(var,count) atomic_fetch_sub_explicit(&var,(count),memory_order_relaxed)
+#define atomicDecrRelease(var,count) atomic_fetch_sub_explicit(&var,(count),memory_order_release)
 #define atomicGet(var,dstvar) do { \
     dstvar = atomic_load_explicit(&var,memory_order_relaxed); \
 } while(0)
@@ -135,6 +137,7 @@
     oldvalue_var = __atomic_fetch_add(&var,(count),__ATOMIC_RELAXED); \
 } while(0)
 #define atomicDecr(var,count) __atomic_sub_fetch(&var,(count),__ATOMIC_RELAXED)
+#define atomicDecrRelease(var,count) __atomic_sub_fetch(&var,(count),__ATOMIC_RELEASE)
 #define atomicGet(var,dstvar) do { \
     dstvar = __atomic_load_n(&var,__ATOMIC_RELAXED); \
 } while(0)
@@ -164,6 +167,7 @@
     oldvalue_var = __sync_fetch_and_add(&var,(count)); \
 } while(0)
 #define atomicDecr(var,count) __sync_sub_and_fetch(&var,(count))
+#define atomicDecrRelease(var,count) __sync_sub_and_fetch(&var,(count))
 #define atomicGet(var,dstvar) do { \
     dstvar = __sync_sub_and_fetch(&var,0); \
 } while(0)

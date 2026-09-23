@@ -12,6 +12,7 @@
 
 #include "server.h"
 #include "bio.h"
+#include "forkless.h"
 #include "atomicvar.h"
 #include "script.h"
 #include "cluster.h"
@@ -541,6 +542,9 @@ int performEvictions(void) {
     int slaves = listLength(server.slaves);
     int result = EVICT_FAIL;
 
+    /* Reclaim snapshots already encoded by the helper before evicting more
+     * live keys. This only releases references; it never waits for output. */
+    forklessReleaseDonePins();
     if (getMaxmemoryState(&mem_reported,NULL,&mem_tofree,NULL) == C_OK) {
         result = EVICT_OK;
         goto update_metrics;
@@ -706,7 +710,14 @@ int performEvictions(void) {
                  * memory, since the "mem_freed" amount is computed only
                  * across the dbAsyncDelete() call, while the thread can
                  * release the memory all the time. */
-                if (server.lazyfree_lazy_eviction) {
+                if (forklessSplitSaveActive()) {
+                    forklessReleaseDonePins();
+                    if (getMaxmemoryState(NULL,NULL,&mem_tofree,NULL) == C_OK)
+                        break;
+                    /* Releases happen outside dbDelete's accounting. Restart
+                     * from the current deficit instead of over-evicting. */
+                    mem_freed = 0;
+                } else if (server.lazyfree_lazy_eviction) {
                     if (getMaxmemoryState(NULL,NULL,NULL,NULL) == C_OK) {
                         break;
                     }
@@ -729,6 +740,10 @@ int performEvictions(void) {
     result = (isEvictionProcRunning) ? EVICT_RUNNING : EVICT_OK;
 
 cant_free:
+    if (result == EVICT_FAIL && forklessSplitSaveActive()) {
+        forklessReleaseDonePins();
+        if (getMaxmemoryState(NULL,NULL,NULL,NULL) == C_OK) result = EVICT_OK;
+    }
     if (result == EVICT_FAIL) {
         /* At this point, we have run out of evictable items.  It's possible
          * that some items are being freed in the lazyfree thread.  Perform a

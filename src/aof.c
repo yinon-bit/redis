@@ -8,6 +8,7 @@
  */
 
 #include "server.h"
+#include "forkless.h"
 #include "bio.h"
 #include "rio.h"
 #include "functions.h"
@@ -3004,7 +3005,7 @@ int rewriteObject(rio *r, robj *key, robj *o, int dbid, long long expiretime) {
     }
 
     /* If modules metadata is available */
-    if ((getModuleMetaBits(o->metabits)) && (keyMetaOnAof(r, key, o, dbid) == 0))
+    if ((getModuleMetaBits(kvobjMetaBits(o))) && (keyMetaOnAof(r, key, o, dbid) == 0))
         return C_ERR;
 
     return C_OK;
@@ -3198,6 +3199,13 @@ int rewriteAppendOnlyFileBackground(void) {
     pid_t childpid;
 
     if (hasActiveChildProcess()) return C_ERR;
+    if (server.bgsave_mode != BGSAVE_MODE_FORK) {
+        serverLog(LL_WARNING,
+            "AOF rewrite is not supported with bgsave-mode %s",
+            bgsaveModeName());
+        server.aof_lastbgrewrite_status = C_ERR;
+        return C_ERR;
+    }
     if (server.backup_state == BACKUP_STATE_SNAPSHOTTING ||
         server.backup_state == BACKUP_STATE_INCREMENTING)
     {

@@ -130,8 +130,16 @@ uint64_t dictGenCaseHashFunction(const unsigned char *buf, size_t len) {
 #define ENTRY_PTR_MASK        7 /* 111 */
 #define ENTRY_PTR_NORMAL      0 /* 000 : If a pointer to an entry with value. */
 #define ENTRY_PTR_IS_ODD_KEY  1 /* XX1 : If a pointer to odd key address (must be 1). */
-#define ENTRY_PTR_IS_EVEN_KEY 2 /* 010 : If a pointer to even key address. (must be 2 or 4). */
-#define ENTRY_PTR_UNUSED      4 /* 100 : Unused. */
+#define ENTRY_PTR_IS_EVEN_KEY 2 /* 010 / 110: aligned direct key, optionally forkless. */
+#define ENTRY_PTR_FORKLESS    4 /* Ownership bit on allocated entries AND aligned direct keys. */
+
+/* Odd direct keys use all address bits; never strip their bit 2. Aligned
+ * direct keys use 010/110, so stripping ownership leaves their kind intact. */
+static inline dictEntry *dictEntryUntag(const dictEntry *de) {
+    uintptr_t bits = (uintptr_t)de & ENTRY_PTR_MASK;
+    if (bits & ENTRY_PTR_IS_ODD_KEY) return (dictEntry *)de;
+    return (dictEntry *)((uintptr_t)de & ~(uintptr_t)ENTRY_PTR_FORKLESS);
+}
 
 /* Returns 1 if the entry pointer is a pointer to a key, rather than to an
  * allocated entry. Returns 0 otherwise. */
@@ -140,9 +148,9 @@ static inline int entryIsKey(const dictEntry *de) {
 }
 
 /* Returns 1 if the pointer is actually a pointer to a dictEntry struct. Returns
- * 0 otherwise. */
+ * 0 otherwise. Forkless tagging uses bit 2 and does not change this. */
 static inline int entryIsNormal(const dictEntry *de) {
-    return ((uintptr_t)(void *)de & ENTRY_PTR_MASK) == ENTRY_PTR_NORMAL;
+    return ((uintptr_t)(void *)de & (ENTRY_PTR_IS_ODD_KEY | ENTRY_PTR_IS_EVEN_KEY)) == 0;
 }
 
 /* Creates an entry without a value field. */
@@ -340,6 +348,7 @@ static void rehashEntriesInBucketAtIndex(dict *d, uint64_t idx) {
     dictEntry *nextde;
     while (de) {
         nextde = dictGetNext(de);
+        int forkless = dictEntryIsForkless(de);
         void *storedKey = dictGetKey(de);
         /* Get the index in the new hash table */
         if (d->ht_size_exp[1] > d->ht_size_exp[0]) {
@@ -369,7 +378,7 @@ static void rehashEntriesInBucketAtIndex(dict *d, uint64_t idx) {
         } else {
             dictSetNext(de, d->ht_table[1][h]);
         }
-        d->ht_table[1][h] = de;
+        d->ht_table[1][h] = dictEntryWithForkless(de, forkless);
         d->ht_used[0]--;
         d->ht_used[1]++;
         de = nextde;
@@ -910,13 +919,15 @@ void dictSetKeyAtLink(dict *d, void *key __stored_key, dictEntryLink *link, int 
     }
     
     dictEntry **de = *link;
+    int forkless = dictEntryIsForkless(*de);
     if (entryIsKey(*de)) {
         /* `de` opt-out to be actually a key. Replace key but keep the lsb flags */
         *de = encodeEntryKey(d, addedKey);
     } else {
         /* either dictEntry or dictEntryNoValue */
-        (*de)->key = addedKey;
+        dictEntryUntag(*de)->key = addedKey;
     }
+    if (forkless) dictSetEntryForkless(de, 1);
 }
 
 void *dictFetchValue(dict *d, const void *key) {
@@ -985,6 +996,7 @@ void dictTwoPhaseUnlinkFree(dict *d, dictEntryLink plink, int table_index) {
 
 void dictSetKey(dict *d, dictEntry* de, void *key __stored_key) {
     assert(!d->type->no_value);
+    de = dictEntryUntag(de);
     if (d->type->keyDup)
         de->key = d->type->keyDup(d, key);
     else
@@ -992,36 +1004,43 @@ void dictSetKey(dict *d, dictEntry* de, void *key __stored_key) {
 }
 
 void dictSetVal(dict *d, dictEntry *de, void *val) {
+    de = dictEntryUntag(de);
     assert(entryHasValue(de));
     de->v.val = d->type->valDup ? d->type->valDup(d, val) : val;
 }
 
 void dictSetSignedIntegerVal(dictEntry *de, int64_t val) {
+    de = dictEntryUntag(de);
     assert(entryHasValue(de));
     de->v.s64 = val;
 }
 
 void dictSetUnsignedIntegerVal(dictEntry *de, uint64_t val) {
+    de = dictEntryUntag(de);
     assert(entryHasValue(de));
     de->v.u64 = val;
 }
 
 void dictSetDoubleVal(dictEntry *de, double val) {
+    de = dictEntryUntag(de);
     assert(entryHasValue(de));
     de->v.d = val;
 }
 
 int64_t dictIncrSignedIntegerVal(dictEntry *de, int64_t val) {
+    de = dictEntryUntag(de);
     assert(entryHasValue(de));
     return de->v.s64 += val;
 }
 
 uint64_t dictIncrUnsignedIntegerVal(dictEntry *de, uint64_t val) {
+    de = dictEntryUntag(de);
     assert(entryHasValue(de));
     return de->v.u64 += val;
 }
 
 double dictIncrDoubleVal(dictEntry *de, double val) {
+    de = dictEntryUntag(de);
     assert(entryHasValue(de));
     return de->v.d += val;
 }
@@ -1031,35 +1050,60 @@ int dictEntryIsKey(const dictEntry *de) {
 }
 
 void *dictGetKey(const dictEntry *de) {
+    de = dictEntryUntag(de);
     /* if entryIsKey() */
     if ((uintptr_t)de & ENTRY_PTR_IS_ODD_KEY) return (void *) de;
-    if ((uintptr_t)de & ENTRY_PTR_IS_EVEN_KEY) return decodeMaskedPtr(de);    
-    /* Regular entry */
+    if ((uintptr_t)de & ENTRY_PTR_IS_EVEN_KEY) return decodeMaskedPtr(de);
     return de->key;
 }
 
+int dictEntryIsForkless(const dictEntry *de) {
+    if (de == NULL) return 0;
+    uintptr_t bits = (uintptr_t)de & ENTRY_PTR_MASK;
+    return !(bits & ENTRY_PTR_IS_ODD_KEY) && (bits & ENTRY_PTR_FORKLESS);
+}
+
+dictEntry *dictEntryWithForkless(dictEntry *de, int forkless) {
+    if (de == NULL) return de;
+    uintptr_t bits = (uintptr_t)de & ENTRY_PTR_MASK;
+    if (bits & ENTRY_PTR_IS_ODD_KEY) return de;
+    if (forkless)
+        return (dictEntry *)((uintptr_t)de | ENTRY_PTR_FORKLESS);
+    return (dictEntry *)((uintptr_t)de & ~(uintptr_t)ENTRY_PTR_FORKLESS);
+}
+
+void dictSetEntryForkless(dictEntry **de, int forkless) {
+    if (de == NULL || *de == NULL) return;
+    *de = dictEntryWithForkless(*de, forkless);
+}
+
 void *dictGetVal(const dictEntry *de) {
+    de = dictEntryUntag(de);
     assert(entryHasValue(de));
     return de->v.val;
 }
 
 int64_t dictGetSignedIntegerVal(const dictEntry *de) {
+    de = dictEntryUntag(de);
     assert(entryHasValue(de));
     return de->v.s64;
 }
 
 uint64_t dictGetUnsignedIntegerVal(const dictEntry *de) {
+    de = dictEntryUntag(de);
     assert(entryHasValue(de));
     return de->v.u64;
 }
 
 double dictGetDoubleVal(const dictEntry *de) {
+    de = dictEntryUntag(de);
     assert(entryHasValue(de));
     return de->v.d;
 }
 
 /* Returns a mutable reference to the value as a double within the entry. */
 double *dictGetDoubleValPtr(dictEntry *de) {
+    de = dictEntryUntag(de);
     assert(entryHasValue(de));
     return &de->v.d;
 }
@@ -1067,6 +1111,7 @@ double *dictGetDoubleValPtr(dictEntry *de) {
 /* Returns the 'next' field of the entry or NULL if the entry doesn't have a
  * 'next' field. */
 dictEntry *dictGetNext(const dictEntry *de) {
+    de = dictEntryUntag(de);
     if (entryIsKey(de)) return NULL; /* there's no next */
     /* Must come after entryIsKey() check */
     return de->next;
@@ -1075,12 +1120,14 @@ dictEntry *dictGetNext(const dictEntry *de) {
 /* Returns a pointer to the 'next' field in the entry or NULL if the entry
  * doesn't have a next field. */
 static dictEntryLink dictGetNextLink(dictEntry *de) {
+    de = dictEntryUntag(de);
     if (entryIsKey(de)) return NULL;
     /* Must come after entryIsKey() check */
     return &de->next;
 }
 
 static void dictSetNext(dictEntry *de, dictEntry *next) {
+    de = dictEntryUntag(de);
     assert(!entryIsKey(de));
     /* dictEntryNoValue & dictEntry are layout-compatible */
     de->next = next;
@@ -1378,6 +1425,8 @@ static void dictDefragBucket(dict *d, dictEntry **bucketref, dictDefragFunctions
     dictDefragAllocFunction *defragval = defragfns->defragVal;
     while (bucketref && *bucketref) {
         dictEntry *de = *bucketref, *newde = NULL;
+        int forkless = dictEntryIsForkless(de);
+        de = dictEntryUntag(de);
         void *newkey = defragkey ? defragkey(dictGetKey(de)) : NULL;
 
         if (d->type->no_value) {
@@ -1402,6 +1451,8 @@ static void dictDefragBucket(dict *d, dictEntry **bucketref, dictDefragFunctions
         if (newde) {
             *bucketref = newde;
         }
+        /* Relocating a direct key also replaced the bucket pointer. */
+        *bucketref = dictEntryWithForkless(*bucketref, forkless);
         bucketref = dictGetNextLink(*bucketref);
     }
 }
@@ -1553,8 +1604,8 @@ void dictScanDefragBucket(dict *d,dictScanFunction *fn,
 
         /* if `*plink` still pointing to 'de', then it means that the 
          * visited item wasn't deleted by fn() */
-        if (*plink == de)            
-            plink = &(de->next);
+        if (*plink == de)
+            plink = &(dictEntryUntag(de)->next);
 
         de = next;
     }
@@ -2017,6 +2068,19 @@ static dictType BenchmarkDictTypeNoValue = {
     .no_value = 1,
 };
 
+static uint64_t forklessTestHash(const void *key) {
+    return *(const uint64_t *)key;
+}
+
+static void *forklessTestNoRelocation(void *ptr) {
+    UNUSED(ptr);
+    return NULL;
+}
+
+static void *forklessTestRelocateKey(void *ptr) {
+    return (uint64_t *)ptr + 1;
+}
+
 #define start_benchmark() start = timeInMilliseconds()
 #define end_benchmark(msg) do { \
     elapsed = timeInMilliseconds()-start; \
@@ -2043,6 +2107,58 @@ int dictTest(int argc, char **argv, int flags) {
         }
     } else {
         count = 5000;
+    }
+
+    TEST("Forkless tags survive direct keys, rehash, replacement and defrag") {
+        dictType type = {.hashFunction = forklessTestHash, .no_value = 1};
+        dict *tagged = dictCreate(&type);
+        uint64_t keys[128];
+        dictSetResizeEnabled(DICT_RESIZE_ENABLE);
+        for (int i = 0; i < 128; i++) {
+            keys[i] = i * 16;
+            assert(dictAdd(tagged, &keys[i], NULL) == DICT_OK);
+            dictEntryLink link = dictFindLink(tagged, &keys[i], NULL);
+            dictSetEntryForkless(link, 1);
+            assert(dictEntryIsForkless(*link));
+        }
+        while (dictIsRehashing(tagged)) dictRehash(tagged, 100);
+        assert(dictExpand(tagged, 4096) == DICT_OK);
+        while (dictIsRehashing(tagged)) dictRehash(tagged, 100);
+        for (int i = 0; i < 128; i++) {
+            dictEntry *entry = dictFind(tagged, &keys[i]);
+            assert(entryIsKey(entry));
+            assert(dictEntryIsForkless(entry));
+            assert(dictGetKey(entry) == &keys[i]);
+        }
+        assert(dictShrink(tagged, 128) == DICT_OK);
+        while (dictIsRehashing(tagged)) dictRehash(tagged, 100);
+        int direct = 0, allocated = 0;
+        for (int i = 0; i < 128; i++) {
+            dictEntryLink link = dictFindLink(tagged, &keys[i], NULL);
+            assert(dictEntryIsForkless(*link));
+            if (entryIsKey(*link)) direct++; else allocated++;
+            dictSetKeyAtLink(tagged, &keys[i], &link, 0);
+            assert(dictEntryIsForkless(*link));
+            dictSetEntryForkless(link, 0);
+            assert(!dictEntryIsForkless(*link));
+            assert(dictGetKey(*link) == &keys[i]);
+        }
+        assert(direct && allocated);
+        uint64_t moved[2] = {0, 0};
+        dictEntry *bucket = dictEntryWithForkless(encodeEntryKey(tagged, moved), 1);
+        dictDefragFunctions f = {.defragAlloc = forklessTestNoRelocation,
+                                 .defragKey = forklessTestRelocateKey};
+        dictDefragBucket(tagged, &bucket, &f);
+        assert(dictEntryIsForkless(bucket));
+        assert(dictGetKey(bucket) == moved + 1);
+        /* Odd pointers may naturally have bit 2 set. Never change their address. */
+        for (uintptr_t bits = 1; bits < 8; bits += 2) {
+            dictEntry *odd = (dictEntry *)((uintptr_t)moved | bits);
+            assert(!dictEntryIsForkless(odd));
+            assert(dictEntryWithForkless(odd, 1) == odd);
+            assert(dictGetKey(odd) == (void *)odd);
+        }
+        dictRelease(tagged);
     }
 
     TEST("Add 16 keys and verify dict resize is ok") {

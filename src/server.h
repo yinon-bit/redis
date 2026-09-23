@@ -1135,7 +1135,7 @@ char *getObjectTypeName(robj*);
     _var.refcount = OBJ_STATIC_REFCOUNT; \
     _var.type = OBJ_STRING; \
     _var.encoding = OBJ_ENCODING_RAW; \
-    _var.metabits = 0; \
+    _var.kvflags = 0; \
     _var.iskvobj = 0; \
     _var.ptr = _ptr; \
 } while(0)
@@ -2383,6 +2383,10 @@ struct redisServer {
     long long rdb_last_load_keys_expired;  /* number of expired keys when loading RDB */
     long long rdb_last_load_keys_loaded;   /* number of loaded keys when loading RDB */
     int bgsave_aborted;             /* Set when killing a child, to treat it as aborted even if it succeeds. */
+    int bgsave_mode;                /* BGSAVE_MODE_FORK, FORKLESS, or HYBRID */
+    size_t forkless_string_max;     /* Hybrid-mode string limit; forkless routes all strings */
+    size_t forkless_retained_max_memory; /* Estimated preserved values; 0 disables the limit. */
+    size_t forkless_snapshot_max_memory; /* Snapshot admission budget; frozen at save start. */
     struct saveparam *saveparams;   /* Save points array for RDB */
     int saveparamslen;              /* Number of saving points */
     char *rdb_filename;             /* Name of RDB file */
@@ -3645,6 +3649,11 @@ int allPersistenceDisabled(void);
 int writeCommandsDeniedByDiskError(void);
 sds writeCommandsGetDiskErrorMessage(int);
 
+#define BGSAVE_MODE_FORK 0
+#define BGSAVE_MODE_FORKLESS 1
+#define BGSAVE_MODE_HYBRID 2
+#define RDBFLAGS_NO_EOF (1<<5)
+
 /* RDB persistence */
 #include "rdb.h"
 void killRDBChild(void);
@@ -4301,6 +4310,7 @@ kvobj *setExpireByLink(client *c, redisDb *db, sds key, long long when, dictEntr
 int checkAlreadyExpired(long long when);
 int parseExtendedExpireArgumentsOrReply(client *c, int *flags);
 kvobj *lookupKeyRead(redisDb *db, robj *key);
+kvobj *lookupKey(redisDb *db, robj *key, int flags, dictEntryLink *link);
 kvobj *lookupKeyWrite(redisDb *db, robj *key);
 kvobj *lookupKeyWriteWithLink(redisDb *db, robj *key, dictEntryLink *link);
 kvobj *lookupKeyReadOrReply(client *c, robj *key, robj *reply);
@@ -4318,6 +4328,7 @@ kvobj *kvobjCommandLookupOrReply(client *c, robj *key, robj *reply);
 #define LOOKUP_NOEXPIRE (1<<4)       /* Avoid deleting lazy expired keys. */
 #define LOOKUP_ACCESS_EXPIRED (1<<5) /* Allow lookup to expired key. */
 #define LOOKUP_ACCESS_TRIMMED (1<<6) /* Allow lookup to key in slots being trimmed. */
+#define LOOKUP_REPLACE (1<<7)        /* Lookup before full replacement: dbSetValue captures the snapshot. */
 #define LOOKUP_NOEFFECTS (LOOKUP_NONOTIFY | LOOKUP_NOSTATS | LOOKUP_NOTOUCH | LOOKUP_NOEXPIRE) /* Avoid any effects from fetching the key */
 
 static inline kvobj *dictGetKV(const dictEntry *de) {return (kvobj *) dictGetKey(de);}
@@ -4373,6 +4384,7 @@ typedef void (*lazyfreeKvsCallback)(kvstore *kvs, void *userdata);
 void emptyDbDataAsync(kvstore *keys, kvstore *expires, ebuckets hexpires,
                       dict *stream_idmp_keys, lazyfreeKvsCallback callback, void *userdata);
 size_t lazyfreeGetPendingObjectsCount(void);
+int lazyfreeHasPendingDbJobs(void);
 size_t lazyfreeGetFreedObjectsCount(void);
 void lazyfreeResetStats(void);
 void freeObjAsync(robj *key, robj *obj, int dbid);

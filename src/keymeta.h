@@ -5,21 +5,21 @@
  * ----------------
  * keymeta is a framework for attaching & maintaining metadata to keys. 
  * 
- * - Up to 8 different metadata classes can be registered globally. First one
+ * - Up to 6 different metadata classes can be registered globally. First one
  *   is reserved for EXPIRE.
  * - Each class has a unique ID and name, like modules datat-types names, yet 
  *   it has its own namespace.
  * - Each key metadata class provides a set of callbacks for key lifecycle operations, 
  *   ensuring consistent handling across copy, rename, logical removal (unlink), 
  *   actual deallocation (free), persistence (RDB/AOF), and defragmentation. 
- * - Each key can carry up to 8 independent metadata values. Each value is related 
+ * - Each key can carry up to 6 independent metadata values. Each value is related
  *   to a specific metadata class. 
  * - The 8-byte slot can either hold inline data or a pointer/handle to a larger, 
  *   externally managed structure.
  *
  * Relation to other components
  * ----------------------------
- * - kvobj: 8 bits metabits field in kvobj is used to indicate active metadata.
+ * - kvobj: 6 bits metabits field in kvobj is used to indicate active metadata.
  *   bit number corresponds to class ID. 
  * - Expiration: class ID 0 is reserved for TTL/expire; 
  * - Registration: redisServer.keyMetaClass[] stores registered classes. Modules
@@ -47,10 +47,12 @@ typedef int KeyMetaClassId; /* Index into redisServer.keyMetaClass[] */
 
 /* kvmeta - Metadata to be attached to kvobj */
 #define KEY_META_ID_EXPIRE        0 /* Must be first */
-/* IDs 1..7 are available for modules */
+/* IDs 1..5 are available for modules. The other two header bits are snapshot
+ * flags, not metadata slots, and must never enter metadata masks or RDB data. */
 #define KEY_META_ID_MODULE_FIRST  1
-#define KEY_META_ID_MODULE_LAST   7
-#define KEY_META_ID_MAX           8
+#define KEY_META_ID_MODULE_LAST   5
+#define KEY_META_ID_MAX           6
+#define KEY_META_MASK_ALL         ((1U << KEY_META_ID_MAX) - 1)
 
 #define KEY_META_MAX_NUM_MODULES  (KEY_META_ID_MODULE_LAST - KEY_META_ID_MODULE_FIRST + 1)
 
@@ -135,6 +137,7 @@ void keyMetaTransition(kvobj *kvOld, kvobj *kvNew);
 
 /* return 0 if failed to create. Otherwise return handle (between 1 and 7) */
 KeyMetaClassId keyMetaClassCreate(struct RedisModule *ctx, const char *metaname, int metaver, KeyMetaClassConf *conf);
+int keyMetaHasModuleClasses(void);
 /* Destroy (release) a previously created class. Return 1 on success, 0 on failure. */
 int keyMetaClassRelease(KeyMetaClassId class_id);
 
@@ -149,10 +152,10 @@ static inline uint32_t getModuleMetaBits(uint16_t metabits);
 /********** Inline functions **********/
 
 static inline void keyMetaResetValues(kvobj *kv) {
-    if (unlikely(kv->metabits & KEY_META_MASK_MODULES))
+    if (unlikely(kvobjMetaBits(kv) & KEY_META_MASK_MODULES))
         keyMetaResetModuleValues(kv);
     /* Must be first meta (optimized) */
-    if (kv->metabits & KEY_META_MASK_EXPIRE)
+    if (kvobjMetaBits(kv) & KEY_META_MASK_EXPIRE)
         ((uint64_t *)kv)[-1] = -1;
 }
 
@@ -162,7 +165,7 @@ static inline void keyMetaSpecInit(KeyMetaSpec *keymeta) {
     keymeta->numMeta = 0;
 }
 
-/* Add metadata to keymeta spec. metaid must be in range 0..7 and added in order! */
+/* Add metadata to keymeta spec. metaid must be in range 0..5 and added in order! */
 void keyMetaSpecAdd(KeyMetaSpec *keymeta, int metaid, uint64_t metaval);
 
 /* Free any metadata stored in a KeyMetaSpec. This is called when RDB load fails after

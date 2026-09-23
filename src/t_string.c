@@ -8,6 +8,7 @@
  */
 
 #include "server.h"
+#include "forkless.h"
 #include "cluster.h"
 #include "xxhash.h"
 #include <float.h>
@@ -101,7 +102,9 @@ void setGenericCommand(client *c, int flags, robj *key, robj **valref, robj *exp
     }
 
     dictEntryLink link = NULL;
-    found = (lookupKeyWriteWithLink(c->db,key,&link) != NULL);
+    /* Conditions may reject SET without any mutation. Defer snapshot capture
+     * to the actual replacement, which can retain the original string. */
+    found = (lookupKey(c->db, key, LOOKUP_WRITE | LOOKUP_REPLACE, &link) != NULL);
 
     if ((flags & OBJ_SET_NX && found) ||
         (flags & (OBJ_SET_XX | OBJ_SET_IFEQ | OBJ_SET_IFDEQ) && !found))
@@ -630,9 +633,10 @@ void setrangeCommand(client *c) {
         if (server.memory_tracking_enabled)
             oldsize = kvobjAllocSize(kv);
         kv->ptr = sdsgrowzero(kv->ptr,offset+value_len);
+        memcpy((char*)kv->ptr+offset,value,value_len);
+        forklessMigrateIfNeeded(c->db, c->argv[1], &kv, link);
         if (server.memory_tracking_enabled)
             updateSlotAllocSize(c->db, getKeySlot(c->argv[1]->ptr), kv, oldsize, kvobjAllocSize(kv));
-        memcpy((char*)kv->ptr+offset,value,value_len);
         keyModified(c,c->db,c->argv[1],kv,1);
         notifyKeyspaceEvent(NOTIFY_STRING,
             "setrange",c->argv[1],c->db->id);
@@ -1391,6 +1395,7 @@ void appendCommand(client *c) {
         if (server.memory_tracking_enabled)
             oldsize = kvobjAllocSize(o);
         o->ptr = sdscatlen(o->ptr,append->ptr,append_len);
+        forklessMigrateIfNeeded(c->db, c->argv[1], &o, link);
         if (server.memory_tracking_enabled)
             updateSlotAllocSize(c->db, getKeySlot(c->argv[1]->ptr), o, oldsize, kvobjAllocSize(o));
         totlen = sdslen(o->ptr);
@@ -1675,4 +1680,3 @@ void digestCommand(client *c) {
 
     addReplyBulkSds(c, stringDigest(o));
 }
-
