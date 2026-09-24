@@ -2384,6 +2384,8 @@ struct redisServer {
     long long rdb_last_load_keys_loaded;   /* number of loaded keys when loading RDB */
     int bgsave_aborted;             /* Set when killing a child, to treat it as aborted even if it succeeds. */
     int bgsave_mode;                /* BGSAVE_MODE_FORK, FORKLESS, or HYBRID */
+    int forkless_arena_tcache;      /* Startup-only main-thread arena cache experiment. */
+    int forkless_timing;            /* Opt-in elapsed-time diagnostics (not CPU time). */
     size_t forkless_string_max;     /* Hybrid-mode string limit; forkless routes all strings */
     size_t forkless_retained_max_memory; /* Estimated preserved values; 0 disables the limit. */
     size_t forkless_snapshot_max_memory; /* Snapshot admission budget; frozen at save start. */

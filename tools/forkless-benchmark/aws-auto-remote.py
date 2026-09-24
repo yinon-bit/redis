@@ -45,10 +45,17 @@ def execute(config):
     def bundle(number):
         # Preserve metrics/logs/source identity, not multi-GB RDBs after validation.
         paths=[p for p in evidence.rglob('*') if p.is_file() and not p.is_symlink() and p.name!='SHA256SUMS']
+        if config.get('quick'):
+            paths=[p for p in paths if p.parent==evidence or p.relative_to(evidence).parts[0]==f'case-{number}']
+            paths=[p for p in paths if p.name!='receipt.json']
         (evidence/'SHA256SUMS').write_text(''.join(f'{sha(p)}  {p.relative_to(evidence)}\n' for p in paths))
         archive=root/f'artifacts-{number}.tar.gz'
         with tarfile.open(archive,'w:gz',compresslevel=1) as t:
-            t.add(evidence,arcname='evidence')
+            if config.get('quick'):
+                for p in paths+[evidence/'SHA256SUMS']:
+                    t.add(p,arcname='evidence/'+str(p.relative_to(evidence)),recursive=False)
+            else:
+                t.add(evidence,arcname='evidence')
         put(config['artifact_urls'][number],archive)
         receipt=evidence/'receipt.json'
         receipt.write_text(json.dumps({'archive':archive.name,'sha256':sha(archive)}))
@@ -93,6 +100,18 @@ def execute(config):
         (evidence/'source-sha256.txt').write_text(config['source_sha256']+'\n')
         command(['make','-C',str(source/'src'),'-j6','MALLOC=jemalloc'],'build.log')
         tools=source/'tools/forkless-benchmark'
+        seed_manifest={}; published=set()
+        if config.get('quick'):
+            cache=Path('/mnt/redis-benchmark/seed-cache'); cache.mkdir()
+            for key, entry in config['seeds'].items():
+                if 'get_url' not in entry: continue
+                dest=cache/(key+'.rdb')
+                try:
+                    with urllib.request.urlopen(entry['get_url'],timeout=120) as src, dest.open('wb') as dst:
+                        shutil.copyfileobj(src,dst)
+                except Exception: raise RuntimeError('Seed download failed') from None
+                if sha(dest)!=entry['sha256']: raise RuntimeError('Remote seed checksum mismatch')
+                Path(str(dest)+'.sha256').write_text(entry['sha256'])
         fixture_source=root/'fixture-source'
         if any(s.get('case',{}).get('fixture') for s in config['setups']):
             command(['python3',str(tools/'prepare-fixture-build.py'),str(source),str(fixture_source)],'fixture-prepare.log')
@@ -100,7 +119,7 @@ def execute(config):
             shutil.copyfile(fixture_source/'fixture-build.json',evidence/'fixture-build.json')
         for index, setup in enumerate(config['setups']):
             if time.time()+setup['timeout_seconds']+300>config['deadline_epoch']:
-                state['cases'].append({'case_id':setup['scenario'],'status':'not_run_deadline'})
+                state['cases'].append({'case_id':setup['scenario'],'mode':setup['mode'],'status':'not_run_deadline'})
                 continue
             case_root=root/f'case-{index}'; case_root.mkdir()
             setup['redis_binary']=str(source/'src/redis-server')
@@ -108,8 +127,10 @@ def execute(config):
                 setup['fixture']=True
                 setup['redis_binary']=str(fixture_source/'src/redis-server')
             setup['data_dir']='/mnt/redis-benchmark'
+            if config.get('quick'):
+                setup['seed_cache']=str(cache/(setup['seed_key']+'.rdb'))
             setup_path=case_root/'setup.json'; setup_path.write_text(json.dumps(setup,indent=2))
-            state['status']='running'; state['active_case']=setup['scenario']; status()
+            state['status']='running'; state['active_case']=setup['scenario']; state['active_mode']=setup['mode']; state['active_index']=index; status()
             worker='spec-worker.py' if setup['scenario']!='custom' else 'scenario-worker.py'
             if setup.get('fixture'): worker='fixture-worker.py'
             with (case_root/'runner.log').open('wb') as log:
@@ -124,9 +145,24 @@ def execute(config):
                 for p in actual.rglob('*'):
                     if p.is_file() and not p.is_symlink() and p.suffix not in ('.rdb','.so'):
                         dest=target/'output'/p.relative_to(actual); dest.parent.mkdir(parents=True,exist_ok=True); dest.write_bytes(p.read_bytes())
-            state['cases'].append({'case_id':setup['scenario'],'exit_code':run.returncode,
+            state['cases'].append({'case_id':setup['scenario'],'mode':setup['mode'],'exit_code':run.returncode,
                                    'status':'completed' if run.returncode==0 else 'failed'})
+            if config.get('quick') and run.returncode==0 and setup['seed_key'] not in published:
+                key=setup['seed_key']; entry=config['seeds'][key]; seed=Path(setup['seed_cache'])
+                put(entry['put_url'],seed)
+                seed_manifest[key]={k:entry[k] for k in ('identity','bucket','key')}
+                seed_manifest[key]['sha256']=sha(seed)
+                (evidence/'seed-manifest.json').write_text(json.dumps(seed_manifest,indent=2))
+                published.add(key)
             bundle(index); status()
+            # RDBs are temporary and excluded from evidence by contract. Remove
+            # only this completed case's files after successful evidence upload.
+            # Leave logs/results and failed attempts intact; never follow links.
+            data_root=Path(setup['data_dir'])/setup['run_id']
+            if data_root.parent==Path('/mnt/redis-benchmark') and not data_root.is_symlink():
+                for dump in data_root.rglob('*.rdb'):
+                    if dump.is_file() and not dump.is_symlink() and data_root.resolve() in dump.resolve().parents:
+                        dump.unlink()
         state['status']='completed' if all(x['status']=='completed' for x in state['cases']) else 'incomplete'
     except BaseException as exc:
         state['status']='failed'; state['error_type']=type(exc).__name__

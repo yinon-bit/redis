@@ -19,6 +19,9 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <limits.h>
+#include <sys/wait.h>
 
 #ifdef __linux__
 #include <sys/mman.h>
@@ -237,6 +240,63 @@ static void (*zmalloc_oom_handler)(size_t) = zmalloc_default_oom;
 #if defined(USE_JEMALLOC)
 static __thread int zmalloc_tls_flags = 0;
 
+/* Opt-in experiment: only the initializing (server main) thread owns this
+ * cache. Worker frees bypass it. Never put another arena's regions into it. */
+static unsigned zmalloc_cached_arena = UINT_MAX;
+static __thread unsigned zmalloc_arena_cache = UINT_MAX;
+
+static void zmallocArenaCacheBeforeFork(void) {
+    if (zmalloc_arena_cache != UINT_MAX &&
+        je_mallctl("tcache.flush", NULL, NULL, &zmalloc_arena_cache,
+                   sizeof(zmalloc_arena_cache)) != 0) abort();
+}
+
+static void zmallocArenaCacheAfterFork(void) {
+    /* Do not destroy/flush inherited caches in the child: they may contain
+     * DONTFORK addresses when another thread initiated the fork. */
+    zmalloc_arena_cache = UINT_MAX;
+    zmalloc_tls_flags = 0;
+}
+
+int zmallocArenaCacheInit(unsigned arena) {
+    if (zmalloc_cached_arena != UINT_MAX) return 0;
+    unsigned cache;
+    size_t len = sizeof(cache);
+    if (je_mallctl("tcache.create", &cache, &len, NULL, 0)) return 0;
+    if (pthread_atfork(zmallocArenaCacheBeforeFork, NULL,
+                       zmallocArenaCacheAfterFork)) {
+        je_mallctl("tcache.destroy", NULL, NULL, &cache, sizeof(cache));
+        return 0;
+    }
+    zmalloc_cached_arena = arena;
+    zmalloc_arena_cache = cache;
+    return 1;
+}
+
+int zmallocArenaFlags(unsigned arena) {
+    int cache = MALLOCX_TCACHE_NONE;
+    if (arena == zmalloc_cached_arena && zmalloc_arena_cache != UINT_MAX)
+        cache = MALLOCX_TCACHE(zmalloc_arena_cache);
+    return MALLOCX_ARENA(arena) | cache;
+}
+
+/* Reallocation can release the old allocation into the selected tcache.
+ * A destination arena alone therefore cannot select the cache safely. */
+static int zmallocSafeReallocFlags(void *ptr, int flags) {
+    if (zmalloc_arena_cache != UINT_MAX &&
+        flags == zmallocArenaFlags(zmalloc_cached_arena) &&
+        zmallocPtrArenaIndex(ptr) != (int)zmalloc_cached_arena)
+        return MALLOCX_ARENA(zmalloc_cached_arena) | MALLOCX_TCACHE_NONE;
+    return flags;
+}
+
+static int zmallocArenaFreeFlags(void *ptr) {
+    if (zmalloc_arena_cache != UINT_MAX &&
+        zmallocPtrArenaIndex(ptr) == (int)zmalloc_cached_arena)
+        return MALLOCX_TCACHE(zmalloc_arena_cache);
+    return MALLOCX_TCACHE_NONE;
+}
+
 void zmalloc_set_thread_flags(int flags) {
     zmalloc_tls_flags = flags;
 }
@@ -252,8 +312,9 @@ int zmalloc_get_thread_flags(void) {
  * A DONTFORK region freed through the automatic tcache would therefore be
  * handed to unrelated memory, which the RDB child may legitimately read.
  *
- * Frees and reallocs inside the window below bypass the tcache so those pages
- * can only ever return to their own arena. The window is the bounding box of
+ * Frees and reallocs inside the window below bypass the automatic tcache.
+ * The opt-in main-thread cache additionally verifies exact arena ownership.
+ * The window is the bounding box of
  * the arena's extents, so it can also contain unrelated pointers; that is
  * deliberate. A false positive costs the tcache fast path and nothing else,
  * while a false negative would be a correctness bug, so the test is
@@ -409,7 +470,7 @@ void *zrealloc_with_flags(void *ptr, size_t size, int flags) {
     }
 
     size_t oldsize = zmalloc_size(ptr);
-    void *newptr = rallocx(ptr, size, flags);
+    void *newptr = rallocx(ptr, size, zmallocSafeReallocFlags(ptr, flags));
     if (newptr == NULL) {
         zmalloc_oom_handler(size);
         return NULL;
@@ -424,7 +485,7 @@ void *zrealloc_with_flags(void *ptr, size_t size, int flags) {
 void zfree_with_flags(void *ptr, int flags) {
     if (ptr == NULL) return;
     update_zmalloc_stat_free(zmalloc_size(ptr));
-    dallocx(ptr, flags);
+    dallocx(ptr, zmallocSafeReallocFlags(ptr, flags));
 }
 #else
 int zmallocPtrArenaIndex(void *ptr) {
@@ -579,7 +640,7 @@ static inline void *ztryrealloc_usable_internal(void *ptr, size_t size, size_t *
 #if defined(USE_JEMALLOC)
     if (zmalloc_tls_flags) {
         oldsize = zmalloc_size(ptr);
-        newptr = rallocx(ptr, size + PREFIX_SIZE, zmalloc_tls_flags);
+        newptr = rallocx(ptr, size + PREFIX_SIZE, zmallocSafeReallocFlags(ptr, zmalloc_tls_flags));
         if (newptr == NULL) {
             *usable = 0;
             *old_usable = oldsize;
@@ -600,7 +661,11 @@ static inline void *ztryrealloc_usable_internal(void *ptr, size_t size, size_t *
          * stays correct (it is still tagged, so the parent serializes it) and
          * is re-routed by the next DB-level update. */
         oldsize = zmalloc_size(ptr);
-        newptr = rallocx(ptr, size + PREFIX_SIZE, MALLOCX_TCACHE_NONE);
+        int arena_flags = MALLOCX_TCACHE_NONE;
+        if (zmalloc_arena_cache != UINT_MAX &&
+            zmallocPtrArenaIndex(ptr) == (int)zmalloc_cached_arena)
+            arena_flags = zmallocArenaFlags(zmalloc_cached_arena);
+        newptr = rallocx(ptr, size + PREFIX_SIZE, arena_flags);
         if (newptr == NULL) {
             *usable = 0;
             *old_usable = oldsize;
@@ -717,7 +782,7 @@ void zfree(void *ptr) {
 #if defined(USE_JEMALLOC)
     if (zmallocNoTcachePtr(ptr)) {
         update_zmalloc_stat_free(zmalloc_size(ptr));
-        dallocx(ptr, MALLOCX_TCACHE_NONE);
+        dallocx(ptr, zmallocArenaFreeFlags(ptr));
         return;
     }
 #endif
@@ -752,7 +817,7 @@ void zfree_usable(void *ptr, size_t *usable) {
 #if defined(USE_JEMALLOC)
     if (zmallocNoTcachePtr(ptr)) {
         update_zmalloc_stat_free(oldsize = zmalloc_size(ptr));
-        dallocx(ptr, MALLOCX_TCACHE_NONE);
+        dallocx(ptr, zmallocArenaFreeFlags(ptr));
         if (usable) *usable = oldsize;
         return;
     }
@@ -780,7 +845,7 @@ void zfree_with_size(void *ptr, size_t size) {
     if (ptr == NULL) return;
 #ifdef USE_JEMALLOC
     update_zmalloc_stat_free(size);
-    je_sdallocx(ptr, size, zmallocNoTcachePtr(ptr) ? MALLOCX_TCACHE_NONE : 0);
+    je_sdallocx(ptr, size, zmallocNoTcachePtr(ptr) ? zmallocArenaFreeFlags(ptr) : 0);
 #else
     UNUSED(size);
     zfree(ptr);
@@ -1403,6 +1468,14 @@ size_t zmalloc_get_memory_size(void) {
 
 #define TEST(name) printf("test — %s\n", name);
 
+#ifdef USE_JEMALLOC
+static void *zmallocCacheTestWorker(void *arg) {
+    unsigned arena = *(unsigned *)arg;
+    assert(zmallocArenaFlags(arena) == (MALLOCX_ARENA(arena) | MALLOCX_TCACHE_NONE));
+    return NULL;
+}
+#endif
+
 int zmalloc_test(int argc, char **argv, int flags) {
     void *ptr, *ptr2;
 
@@ -1443,6 +1516,47 @@ int zmalloc_test(int argc, char **argv, int flags) {
         zfree(ptr);
     }
 
+#ifdef USE_JEMALLOC
+    TEST("Dedicated arena cache never mixes default and arena allocations") {
+        unsigned arena;
+        size_t len = sizeof(arena);
+        assert(je_mallctl("arenas.create", &arena, &len, NULL, 0) == 0);
+        assert(zmallocArenaCacheInit(arena));
+        assert(zmallocArenaFlags(arena) != (MALLOCX_ARENA(arena) | MALLOCX_TCACHE_NONE));
+        for (int i = 0; i < 2000; i++) {
+            ptr = zmalloc_with_flags(128, zmallocArenaFlags(arena));
+            assert(zmallocPtrArenaIndex(ptr) == (int)arena);
+            zmallocNoTcacheWindowAdd(ptr, zmalloc_size(ptr));
+            if (i % 3 == 0) zfree(ptr);
+            else if (i % 3 == 1) zfree_usable(ptr, NULL);
+            else zfree_with_size(ptr, zmalloc_size(ptr));
+            ptr = zmalloc(128);
+            assert(zmallocPtrArenaIndex(ptr) != (int)arena);
+            /* A realloc under destination flags must not cache a foreign
+             * source allocation, whether it moves or grows in place. */
+            ptr = zrealloc_with_flags(ptr, 256, zmallocArenaFlags(arena));
+            zfree_with_flags(ptr, zmallocArenaFlags(arena));
+        }
+        ptr = zmalloc_with_flags(128, zmallocArenaFlags(arena));
+        zmallocNoTcacheWindowAdd(ptr, zmalloc_size(ptr));
+        ptr = zrealloc(ptr, 4096);
+        assert(zmallocPtrArenaIndex(ptr) == (int)arena);
+        zmallocNoTcacheWindowAdd(ptr, zmalloc_size(ptr));
+        zfree(ptr);
+        pthread_t worker;
+        assert(pthread_create(&worker, NULL, zmallocCacheTestWorker, &arena) == 0);
+        assert(pthread_join(worker, NULL) == 0);
+        pid_t child = fork();
+        assert(child >= 0);
+        if (child == 0) {
+            _exit(zmallocArenaFlags(arena) == (MALLOCX_ARENA(arena) | MALLOCX_TCACHE_NONE) ? 0 : 1);
+        }
+        int status;
+        assert(waitpid(child, &status, 0) == child);
+        assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        assert(zmallocArenaFlags(arena) != (MALLOCX_ARENA(arena) | MALLOCX_TCACHE_NONE));
+    }
+#endif
     TEST("At the end used memory is 0") {
         assert(zmalloc_used_memory() == 0);
     }

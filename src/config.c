@@ -3562,6 +3562,9 @@ standardConfig static_configs[] = {
     createULongLongConfig("maxmemory", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.maxmemory, 0, MEMORY_CONFIG, NULL, updateMaxmemory),
     createULongLongConfig("cluster-link-sendbuf-limit", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.cluster_link_msg_queue_limit_bytes, 0, MEMORY_CONFIG, NULL, NULL),
 
+    createBoolConfig("forkless-arena-tcache", NULL, IMMUTABLE_CONFIG, server.forkless_arena_tcache, 0, NULL, NULL),
+    createBoolConfig("forkless-timing", NULL, IMMUTABLE_CONFIG, server.forkless_timing, 0, NULL, NULL),
+
     /* Size_t configs */
     createSizeTConfig("forkless-string-max", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.forkless_string_max, 500*1024, MEMORY_CONFIG, NULL, NULL),
     createSizeTConfig("forkless-retained-max-memory", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.forkless_retained_max_memory, 0, MEMORY_CONFIG, NULL, NULL),

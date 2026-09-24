@@ -1946,12 +1946,67 @@ werr:
     return -1;
 }
 
+/* Child-only look-ahead: retain pointers, never copies of fork-owned values.
+ * At most 256 dictionary entries are visited per turn, and at most 64
+ * child-owned entries are queued. Each turn then encodes one queued entry.
+ * An all-large-key workload therefore progresses without waiting for small
+ * work; an all-small workload keeps feeding the helper without an empty wait. */
+#define RDB_HYBRID_LOOKAHEAD 256
+#define RDB_HYBRID_CHILD_QUEUE 64
+typedef struct rdbHybridLookahead {
+    struct {
+        dictEntry *de;
+        int slot;
+    } queue[RDB_HYBRID_CHILD_QUEUE];
+    size_t head, count;
+    int exhausted;
+} rdbHybridLookahead;
+
+static int rdbHybridNext(kvstoreIterator *it, rdbHybridLookahead *look,
+                         int dbid, dictEntry **entry, int *slot,
+                         unsigned long long *skipped)
+{
+    do {
+        for (int scanned = 0; scanned < RDB_HYBRID_LOOKAHEAD &&
+             look->count < RDB_HYBRID_CHILD_QUEUE && !look->exhausted; scanned++) {
+            dictEntry *de = kvstoreIteratorNext(it);
+            if (!de) {
+                look->exhausted = 1;
+                break;
+            }
+            int current = kvstoreIteratorGetCurrentDictIndex(it);
+            if (server.cluster_enabled && isSlotInTrimJob(current)) {
+                (*skipped)++;
+            } else if (dictEntryIsForkless(de)) {
+                if (forklessEmitWork(dictGetKV(de), dbid) == C_ERR) return C_ERR;
+                (*skipped)++;
+            } else {
+                size_t tail = (look->head + look->count++) % RDB_HYBRID_CHILD_QUEUE;
+                look->queue[tail].de = de;
+                look->queue[tail].slot = current;
+            }
+        }
+        if (forklessChildPumpWork() == C_ERR) return C_ERR;
+    } while (!look->count && !look->exhausted);
+
+    *entry = NULL;
+    if (look->count) {
+        *entry = look->queue[look->head].de;
+        *slot = look->queue[look->head].slot;
+        look->head = (look->head + 1) % RDB_HYBRID_CHILD_QUEUE;
+        look->count--;
+    }
+    return C_OK;
+}
+
 ssize_t rdbSaveDb(rio *rdb, int dbid, int rdbflags, long *key_counter, unsigned long long *skipped) {
     dictEntry *de;
     ssize_t written = 0;
     ssize_t res;
     size_t oldsize = 0;
     kvstoreIterator kvs_it;
+    int split = server.in_fork_child && forklessSplitSaveActive();
+    rdbHybridLookahead look = {0};
     static long long info_updated_time = 0;
     char *pname = (rdbflags & RDBFLAGS_AOF_PREAMBLE) ? "AOF rewrite" :  "RDB";
 
@@ -1977,8 +2032,20 @@ ssize_t rdbSaveDb(rio *rdb, int dbid, int rdbflags, long *key_counter, unsigned 
     kvstoreIteratorInit(&kvs_it, db->keys);
     int last_slot = -1;
     /* Iterate this DB writing every entry */
-    while ((de = kvstoreIteratorNext(&kvs_it)) != NULL) {
-        int curr_slot = kvstoreIteratorGetCurrentDictIndex(&kvs_it);
+    while (1) {
+        int curr_slot;
+        if (split) {
+            if (rdbHybridNext(&kvs_it, &look, dbid, &de, &curr_slot, skipped) == C_ERR)
+                goto werr2;
+        } else {
+            de = kvstoreIteratorNext(&kvs_it);
+            curr_slot = de ? kvstoreIteratorGetCurrentDictIndex(&kvs_it) : -1;
+        }
+        if (!de) break;
+        /* The pump can relay another DB's frames. Restore our DB before
+         * either slot metadata or a child-owned key is emitted. */
+        if (split && (rdbSaveType(rdb, RDB_OPCODE_SELECTDB) == -1 ||
+                      rdbSaveLen(rdb, dbid) == -1)) goto werr2;
         /* Save slot info. */
         if (server.cluster_enabled && curr_slot != last_slot) {
             if ((res = rdbSaveType(rdb, RDB_OPCODE_SLOT_INFO)) < 0) goto werr2;
@@ -2000,19 +2067,7 @@ ssize_t rdbSaveDb(rio *rdb, int dbid, int rdbflags, long *key_counter, unsigned 
             (*skipped)++;
             continue;
         }
-        if (server.in_fork_child && forklessSplitSaveActive() && dictEntryIsForkless(de)) {
-            /* Child frozen dict enumerates forkless keys for the parent
-             * serializer (pointer + dbid only; DONTFORK payloads stay in parent). */
-            if (forklessEmitWork(dictGetKV(de), dbid) != C_OK) goto werr2;
-            (*skipped)++;
-            continue;
-        }
         kvobj *kv = dictGetKV(de);
-        /* Relaying helper frames may have selected a different database. */
-        if (server.in_fork_child && forklessSplitSaveActive()) {
-            if (rdbSaveType(rdb, RDB_OPCODE_SELECTDB) == -1 ||
-                rdbSaveLen(rdb, dbid) == -1) goto werr2;
-        }
         robj key;
         long long expire;
         size_t rdb_bytes_before_key = rdb->processed_bytes;
@@ -2021,7 +2076,9 @@ ssize_t rdbSaveDb(rio *rdb, int dbid, int rdbflags, long *key_counter, unsigned 
         expire = kvobjGetExpire(kv);
         if (server.memory_tracking_enabled)
             oldsize = kvobjAllocSize(kv);
+        unsigned long long encode_started = split ? forklessTimingStart() : 0;
         res = rdbSaveKeyValuePair(rdb, &key, kv, expire, dbid);
+        forklessTimingChildEncode(encode_started);
         if (server.memory_tracking_enabled)
             updateSlotAllocSize(db, curr_slot, kv, oldsize, kvobjAllocSize(kv));
         if (res < 0) goto werr2;
@@ -2049,7 +2106,9 @@ ssize_t rdbSaveDb(rio *rdb, int dbid, int rdbflags, long *key_counter, unsigned 
     /* No later RDB phase walks this database's key dictionary. Drop only
      * bucket-array pages, not entries/objects which other phases may use.
      * This also covers non-cluster databases and the final cluster slot. */
-    if (server.in_fork_child)
+    if (split && server.cluster_enabled)
+        dismissKvstoreBucketsMemory(db->keys); /* Includes helper-only slots. */
+    else if (server.in_fork_child)
         dismissDictBucketsMemory(kvstoreGetDict(db->keys, server.cluster_enabled ? last_slot : 0));
     return written;
 
@@ -2232,12 +2291,18 @@ static int rdbSaveInternal(int req, const char *filename, rdbSaveInfo *rsi, int 
     }
 
     /* Make sure data will not remain on the OS's output buffers */
+    unsigned long long finalize_started = server.in_fork_child && forklessSplitSaveActive() ?
+                                         forklessTimingStart() : 0;
     if (fflush(fp)) { err_op = "fflush"; goto werr; }
     if (fsync(fileno(fp))) { err_op = "fsync"; goto werr; }
     if (!(rdbflags & RDBFLAGS_KEEP_CACHE) && reclaimFilePageCache(fileno(fp), 0, 0) == -1) {
         serverLog(LL_NOTICE,"Unable to reclaim cache after saving RDB: %s", strerror(errno));
     }
     if (fclose(fp)) { fp = NULL; err_op = "fclose"; goto werr; }
+
+    if (finalize_started)
+        serverLog(LL_NOTICE, "Hybrid timing: child_file_finalize_usec=%llu",
+                  (unsigned long long)getMonotonicUs() - finalize_started);
 
     return C_OK;
 

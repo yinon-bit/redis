@@ -35,6 +35,19 @@ class Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             p=Path(temp);self.fixture(p);self.assertEqual(c.check(p)['status'],'PASS')
 
+    def test_non_cumulative(self):
+        with tempfile.TemporaryDirectory() as temp:
+            p=Path(temp);self.fixture(p)
+            (p/'artifacts-1.tar.gz').rename(p/'artifacts-0.tar.gz')
+            (p/'receipt-1.json').rename(p/'receipt-0.json')
+            content=b'{}'
+            manifest=(hashlib.sha256(content).hexdigest()+'  status.json\n').encode()
+            with tarfile.open(p/'artifacts-1.tar.gz','w:gz') as t:
+                for name,data in [('status.json',content),('SHA256SUMS',manifest)]:
+                    entry=tarfile.TarInfo('evidence/'+name);entry.size=len(data);t.addfile(entry,io.BytesIO(data))
+            (p/'receipt-1.json').write_text(json.dumps({'sha256':hashlib.sha256((p/'artifacts-1.tar.gz').read_bytes()).hexdigest()}))
+            self.assertEqual(c.check(p)['status'],'PASS')
+
     def test_missing_receipt(self):
         with tempfile.TemporaryDirectory() as temp:
             p=Path(temp);self.fixture(p);(p/'receipt-1.json').unlink();self.assertEqual(c.check(p)['status'],'MISSING')

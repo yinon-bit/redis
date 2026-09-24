@@ -16,6 +16,34 @@ auto=importlib.util.module_from_spec(spec); spec.loader.exec_module(auto)
 
 
 class Tests(unittest.TestCase):
+    def test_quick(self):
+        case='standard.mixed.write100.ample.cpu6.first.bgsave'
+        args=auto.arguments(['--name','quick','--scenario',case,'--quick'])
+        self.assertEqual(auto.setups(args,'test')[0]['case']['repetitions'],1)
+        normal=auto.arguments(['--name','normal','--scenario',case])
+        self.assertEqual(auto.setups(normal,'test')[0]['case']['repetitions'],3)
+        with self.assertRaises(SystemExit):
+            auto.arguments(['--name','test','--scenario',case,'--seed-manifest','x'])
+
+    def test_seed_identity(self):
+        spec=importlib.util.spec_from_file_location('seed',Path(__file__).with_name('seed-cache.py'))
+        seed=importlib.util.module_from_spec(spec); spec.loader.exec_module(seed)
+        from scenario_catalog import runnable_cases
+        cases=runnable_cases()
+        a=cases['standard.mixed.write100.ample.cpu6.first.bgsave']
+        b=cases['standard.mixed.read100.ample.cpu6.first.bgsave']
+        self.assertEqual(seed.key(a),seed.key(b))
+        self.assertNotEqual(seed.key(a),seed.key(dict(a,small_keys=a['small_keys']+1)))
+        self.assertNotEqual(seed.key(a),seed.key(dict(a,payload_generator='changed')))
+
+    def test_mode_sequence(self):
+        case='standard.mixed.write100.ample.cpu6.first.bgsave'
+        args=auto.arguments(['--name','test','--scenario',case,'--mode','fork','--then-mode','hybrid','--hours','4'])
+        rows=auto.setups(args,'test')
+        self.assertEqual([r['mode'] for r in rows],['fork','hybrid'])
+        self.assertEqual(rows[0]['case'],rows[1]['case'])
+        self.assertNotEqual(rows[0]['run_id'],rows[1]['run_id'])
+
     def test_fixture_selection(self):
         from scenario_catalog import fixture_cases
         self.assertEqual(len(fixture_cases()),109)
@@ -44,6 +72,16 @@ class Tests(unittest.TestCase):
         self.assertIn('shutdown -h now',text)
         self.assertNotIn('AWS_SECRET_ACCESS_KEY',text)
         self.assertLess(len(data),16385)
+
+    def test_remote_bootstrap_config(self):
+        data=auto.bootstrap({'deadline_epoch':1800000000,'setups':['private-marker'*100000]},
+                            'https://example.invalid/config', 'a'*64)
+        script=gzip.decompress(data).decode()
+        self.assertNotIn('private-marker', script)
+        self.assertIn('Configuration checksum mismatch', script)
+        self.assertLess(len(data),16385)
+        with self.assertRaises(ValueError):
+            auto.bootstrap({'deadline_epoch':1800000000}, 'https://example.invalid/config')
 
     def test_config(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -35,26 +35,36 @@ def arguments(argv=None):
     p.add_argument('--case-timeout',type=int,default=1800)
     p.add_argument('--region',default='us-east-2')
     p.add_argument('--mode',choices=['fork','hybrid','forkless'])
+    p.add_argument('--then-mode',choices=['fork','hybrid','forkless'],help='Repeat named cases in this mode on the same instance, after the first mode')
     p.add_argument('--owner',default='yinon_yishay')
     p.add_argument('--team',default='redis_core')
     p.add_argument('--subnet-id',help='Optional public subnet; otherwise discover default-VPC public subnet')
     p.add_argument('--ami-id',help='Optional exact Ubuntu24.04 ARM64 AMI; otherwise resolve and record latest Canonical image')
     p.add_argument('--credentials-expire-at',help='Optional ISO UTC expiration; reject a deadline beyond it')
     p.add_argument('--launch',action='store_true')
+    p.add_argument('--quick',action='store_true',help='One repetition, shared seeds, non-cumulative case archives')
+    p.add_argument('--arena-tcache',action='store_true',help='Enable the experimental forkless arena local cache at startup')
+    p.add_argument('--forkless-timing',action='store_true',help='Enable opt-in helper and child timing telemetry')
+    p.add_argument('--seed-manifest',help='Previously downloaded seed-manifest.json; quick mode only')
     a=p.parse_args(argv)
+    if a.seed_manifest and not a.quick: p.error('--seed-manifest requires --quick')
+    if a.quick and a.config: p.error('--quick currently requires named performance cases')
     if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,39}',a.name): p.error('Name: lowercase letters, digits, underscore or hyphen; max40')
     for value in (a.owner,a.team):
         if not re.fullmatch(r'[a-z0-9]+(?:_[a-z0-9]+)*',value) or len(value)>63: p.error('Invalid owner/team tag')
     if not .5<=a.hours<=6: p.error('hours must be 0.5–6')
     if not 60<=a.case_timeout<=a.hours*3600-600: p.error('Case timeout must fit inside runtime with a 10-minute reserve')
     catalog=runnable_cases()
+    if a.then_mode and (a.config or not a.mode or a.then_mode==a.mode):
+        p.error('--then-mode requires named cases and a different explicit --mode')
     if a.random_cases is not None:
         if not 1<=a.random_cases<=len(catalog): p.error('Invalid random case count')
         a.scenario=random.Random(a.selection_seed).sample(list(performance_cases()),a.random_cases)
     if a.scenario:
+        if a.quick and any(catalog.get(x,{}).get('fixture') for x in a.scenario): p.error('--quick supports performance cases only')
         if len(a.scenario)!=len(set(a.scenario)): p.error('Duplicate scenario')
         if any(x not in catalog for x in a.scenario): p.error('Unknown/unimplemented scenario')
-        if a.mode=='forkless' and any(catalog[x].get('fixture') for x in a.scenario): p.error('Fixture adapter supports fork/hybrid only')
+        if 'forkless' in (a.mode,a.then_mode) and any(catalog[x].get('fixture') for x in a.scenario): p.error('Fixture adapter supports fork/hybrid only')
     if a.credentials_expire_at:
         try:
             expiry_time=datetime.fromisoformat(a.credentials_expire_at.replace('Z','+00:00'))
@@ -75,9 +85,10 @@ def setups(a, run_id):
         c.update(run_id=run_id+'-c0',timeout_seconds=a.case_timeout,launch=False)
         if a.mode: c['mode']=a.mode
         return [c]
+    sequence=[(mode,case) for mode in ([a.mode or 'hybrid']+([a.then_mode] if a.then_mode else [])) for case in a.scenario]
     return [dict(schema='document-cases/1',run_id=run_id+f'-c{i}',name=a.name,scenario=case,
-                 case=runnable_cases()[case],mode=a.mode or 'hybrid',port=16379,timeout_seconds=a.case_timeout)
-            for i,case in enumerate(a.scenario)]
+                 case=dict(runnable_cases()[case], **({'repetitions':1} if a.quick else {}), arena_tcache=a.arena_tcache, forkless_timing=a.forkless_timing),mode=mode,port=16379,timeout_seconds=a.case_timeout,quick=a.quick)
+            for i,(mode,case) in enumerate(sequence)]
 
 
 def source_archive(target):
@@ -85,7 +96,7 @@ def source_archive(target):
     prefixes=('src/','deps/','tests/','utils/','modules/vector-sets/')
     names={n for n in tracked if n and (n.startswith(prefixes) or n in ('redis.conf','runtest','runtest-moduleapi'))}
     names.update('tools/forkless-benchmark/'+name for name in
-                 ('spec-worker.py','scenario-worker.py','scenario-eio.c','fixture-worker.py','fixture-gate.h','prepare-fixture-build.py'))
+                 ('spec-worker.py','scenario-worker.py','scenario-eio.c','fixture-worker.py','fixture-gate.h','prepare-fixture-build.py','seed-cache.py'))
     # Include new implementation source files but never arbitrary untracked secrets/results.
     names.update(str(p.relative_to(ROOT)) for p in (ROOT/'src').glob('*') if p.suffix in ('.c','.h'))
     with tarfile.open(target,'w:gz') as archive:
@@ -96,10 +107,19 @@ def source_archive(target):
     return hashlib.sha256(target.read_bytes()).hexdigest()
 
 
-def bootstrap(config):
+def bootstrap(config, config_url=None, config_sha256=None):
     deadline=datetime.fromtimestamp(config['deadline_epoch'],timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
     encoded_config=base64.b64encode(json.dumps(config).encode()).decode()
     encoded_runner=base64.b64encode((HERE/'aws-auto-remote.py').read_bytes()).decode()
+    config_loader = f"payload=base64.b64decode('{encoded_config}')"
+    if config_url is not None:
+        if not config_sha256 or not re.fullmatch('[0-9a-f]{64}', config_sha256):
+            raise ValueError('Remote configuration requires SHA256')
+        config_loader = f'''import urllib.request, hashlib
+with urllib.request.urlopen({config_url!r}, timeout=60) as response:
+    payload=response.read()
+if hashlib.sha256(payload).hexdigest() != {config_sha256!r}:
+    raise RuntimeError('Configuration checksum mismatch')'''
     script=f'''#!/bin/bash
 set -eu
 umask 077
@@ -108,7 +128,8 @@ systemd-run --unit=redis-auto-deadline --on-calendar='{deadline}' --timer-proper
 python3 - <<'PY'
 import base64
 from pathlib import Path
-Path('/root/redis-auto-config.json').write_bytes(base64.b64decode('{encoded_config}'))
+{config_loader}
+Path('/root/redis-auto-config.json').write_bytes(payload)
 Path('/root/redis-auto-remote.py').write_bytes(base64.b64decode('{encoded_runner}'))
 PY
 python3 /root/redis-auto-remote.py /root/redis-auto-config.json
@@ -147,6 +168,8 @@ def main():
     selected=setups(a,run_id)
     plan=dict(run_id=run_id,instance_type='r7g.2xlarge',region=a.region,hours=a.hours,
               owner=a.owner,team=a.team,cases=[c.get('scenario') for c in selected],
+              case_modes=[c['mode'] for c in selected],
+              quick=a.quick, archive_layout='per-case' if a.quick else 'cumulative',
               result_bucket='new private bucket, retained',inbound_ports=[],
               note='One instance. Presigned uploads require unexpired credentials. Keep launcher running for watchdog/collection/cleanup.')
     print(json.dumps(plan,indent=2))
@@ -210,6 +233,21 @@ def main():
                     setups=selected,status_url=url('status.json','put_object'),
                     artifact_urls=[url(f'artifacts-{i}.tar.gz','put_object') for i in range(len(selected)+1)],
                     receipt_urls=[url(f'receipt-{i}.json','put_object') for i in range(len(selected)+1)])
+        if a.quick:
+            seed_spec=importlib.util.spec_from_file_location('seed_cache',HERE/'seed-cache.py')
+            seed_module=importlib.util.module_from_spec(seed_spec); seed_spec.loader.exec_module(seed_module)
+            prior=json.loads(Path(a.seed_manifest).read_text()) if a.seed_manifest else {}
+            config['quick']=True; config['seeds']={}
+            for setup in selected:
+                seed_key=seed_module.key(setup['case']); setup['seed_key']=seed_key
+                entry={'identity':seed_module.identity(setup['case']), 'bucket':bucket,'key':f'seeds/{seed_key}.rdb',
+                       'put_url':url(f'seeds/{seed_key}.rdb','put_object')}
+                if seed_key in prior:
+                    previous=prior[seed_key]
+                    if previous['identity']!=entry['identity'] or not re.fullmatch('[0-9a-f]{64}',previous['sha256']):
+                        raise RuntimeError('Seed manifest identity/checksum mismatch')
+                    entry.update(sha256=previous['sha256'],get_url=s3.generate_presigned_url('get_object',Params={'Bucket':previous['bucket'],'Key':previous['key']},ExpiresIn=ttl))
+                config['seeds'][seed_key]=entry
         # Exercise the same unauthenticated HTTP path the instance uses before
         # spending on compute. Never include signed URLs in exception output.
         try:
@@ -223,7 +261,12 @@ def main():
             state['transport_preflight']='failed'; record()
             raise RuntimeError('Signed S3 transport preflight failed: '+type(exc).__name__) from None
         state['transport_preflight']='passed'; record()
-        user_data=bootstrap(config)  # Never write signed URLs into local results/logs.
+        # Keep signed configuration private; pass only one short-lived URL to EC2.
+        config_payload=json.dumps(config).encode()
+        s3.put_object(Bucket=bucket,Key='private/bootstrap-config.json',Body=config_payload,
+                      ServerSideEncryption='AES256',ContentType='application/json')
+        user_data=bootstrap(config,url('private/bootstrap-config.json','get_object'),
+                            hashlib.sha256(config_payload).hexdigest())
         group=ec2.create_security_group(GroupName=run_id,Description='Private Redis benchmark: no inbound rules',VpcId=subnet['VpcId'])['GroupId']
         state['security_group']=group; record()
         ec2.create_tags(Resources=[group],Tags=tags)
@@ -256,6 +299,13 @@ def main():
                 s3.download_file(bucket,target.name,str(target))
                 if hashlib.sha256(target.read_bytes()).hexdigest()!=receipt['sha256']: raise RuntimeError('Downloaded archive checksum mismatch')
                 verify_archive(target)
+                if a.quick:
+                    with tarfile.open(target) as archive:
+                        try: seed_member=archive.getmember('evidence/seed-manifest.json')
+                        except KeyError: seed_member=None
+                        if seed_member:
+                            if seed_member.size>1024*1024: raise RuntimeError('Oversized seed manifest')
+                            (out/'seed-manifest.json').write_bytes(archive.extractfile(seed_member).read())
                 (out/f'receipt-{i}.json').write_text(json.dumps(receipt,indent=2))
                 observed.add(i)
                 print(f'Collected and verified archive {i}.')

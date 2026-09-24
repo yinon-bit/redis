@@ -5,6 +5,37 @@ for prerequisites, AWS permissions, validation exit codes and comparison rules.
 
 ## Automatic AWS setup (no existing instance or bucket needed)
 
+### Quick development mode
+
+Add `--quick` to a named-performance-case batch to run **one repetition per
+scenario**, reuse seeds across identical datasets, and upload independent case
+archives. Without it, the existing three-repetition/cumulative behavior remains.
+Fixture/custom cases are not supported in quick mode. One sample is useful for
+iteration, not evidence that a small performance difference is real.
+
+The first quick run creates each distinct dataset once, validates its seed RDB,
+and stores the seed in its private retained result bucket. Selected small/big/mixed
+datasets produce three seeds. The launcher collects `seed-manifest.json` into the
+local result directory. Pass `--quick --seed-manifest /absolute/path/seed-manifest.json`
+on subsequent runs to download those seeds instead of populating via commands.
+The same normal scenario flags and explicit `--launch` approval workflow apply.
+
+Seed identity covers counts, sizes, hash layout and payload-generator version.
+Change the generator version if generation semantics change. Downloads must match
+manifest SHA256; each case still fully validates seed values/encodings using the
+current binary, then loads a fresh copy per attempt. Every output RDB still gets
+full reload validation. Source bucket read permission is required; never delete
+that bucket while its seeds are needed. This stores multi-GB RDBs in S3, unlike
+the result archives, which continue excluding RDBs. Storage charges persist.
+
+Quick archives0..N-1 contain only their own case plus common metadata; archiveN
+contains final metadata/kernel logs. Collect **all** archives and receipts.
+`check-results.py` supports combining these archives. Historical report scripts
+that read only the final cumulative archive must not be used unchanged for quick
+runs. The checksum-verified seed manifest is copied locally automatically.
+
+Quick mode has offline tests; AWS end-to-end timing/reuse is not yet measured.
+
 Use **`run-aws-auto.py`** for the hands-off infrastructure workflow. Install
 `boto3` in your local Python environment, then export temporary AWS credentials
 or use your normal AWS profile. Never save credentials in the scenario JSON.

@@ -6,6 +6,40 @@ This file is guidance, **not authorization to create paid resources**.
 
 ## Scope and safety
 
+### Local-cache profiling run
+
+Use named `profile.<dataset>.<load>.ample.cpu6.first.bgsave` cases:
+datasets `small_only`, `big_only`, `mixed_bytes50`; loads `idle`, `write100`,
+`read100`. Select all nine explicitly to reproduce the local-cache matrix.
+Each has one repetition and 4 GiB of value payload (not Redis allocated RAM).
+Small values are 256 B; big values are 1 MiB. Mixed is 50/50 by payload bytes,
+with 99/1 small/big requests and shuffled insertion. Pipeline is 16, including
+big-only; historical big-only runs using pipeline 1 are not directly comparable.
+
+Example for one case (add repeated `--scenario` arguments for the others):
+
+```sh
+python3 tools/forkless-benchmark/run-aws-auto.py \
+  --name local-cache-profile --mode hybrid --quick \
+  --arena-tcache --forkless-timing --hours 2 \
+  --owner your_owner_tag --team redis_core \
+  --scenario profile.mixed_bytes50.write100.ample.cpu6.first.bgsave
+```
+
+This prints the plan only; add `--launch` after authorization. Requires boto3
+and valid local AWS credentials. `--quick` caches seeds and uploads RDBs plus
+`seed-manifest.json`; a later run can use `--seed-manifest PATH` to download
+checksum-verified seeds from the original private bucket. Without it, seeds
+are rebuilt. Keep the launcher running through collection and cleanup.
+
+Startup configuration is encrypted in private S3 and fetched using a temporary
+signed URL with SHA256 verification, avoiding EC2's 16-KiB user-data limit.
+Do not publish `private/bootstrap-config.json`: it contains temporary signed URLs.
+Helper timing is in INFO and child timing in server logs. Output timings include
+I/O work and blocking, not pure blocked time. Separate role CPU measurement is
+not implemented. Inspect full reload validation, archive checksums, kernel logs,
+and cleanup evidence rather than relying only on process exit status.
+
 - Use `run-aws-auto.py` for automatic provisioning. Do not substitute historical
   scripts in this directory or reuse old resources from local state documents.
 - Each launch creates one paid r7g.2xlarge in us-east-2 by default, encrypted

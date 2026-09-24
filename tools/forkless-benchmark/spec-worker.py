@@ -7,6 +7,8 @@ import hashlib
 import importlib.util
 import json
 import os
+import random
+from array import array
 from pathlib import Path
 import shutil
 import signal
@@ -119,6 +121,10 @@ async def start(c, directory, resources=None, injection=None):
             '--lazyfree-lazy-expire','no','--lazyfree-lazy-server-del','no',
             '--stop-writes-on-bgsave-error','no','--latency-monitor-threshold','1']
     if c['mode'] != 'fork': args += ['--bgsave-mode',c['mode']]
+    if c.get('case', {}).get('arena_tcache'):
+        args += ['--forkless-arena-tcache', 'yes']
+    if c.get('case', {}).get('forkless_timing'):
+        args += ['--forkless-timing', 'yes']
     if c.get('fixture'): args += ['--enable-debug-command','yes']
     env = os.environ.copy()
     if injection: env.update(LD_PRELOAD=str(injection), BENCH_EIO_DIR=str(directory))
@@ -162,6 +168,21 @@ def stop_process(proc):
 
 
 async def populate(conn, case, payload):
+    if case.get('insertion_order')=='shuffled_v1':
+        # Uniform Fisher-Yates shuffle in a compact uint32 array (~32MiB).
+        # This allocation is in the generator, outside Redis' memory cgroup.
+        total=case['small_keys']+case['big_keys']
+        if case['hash_keys'] or total>=2**32: raise ValueError('Unsupported shuffled dataset')
+        order=array('I',range(total)); random.Random(case['insertion_seed']).shuffle(order)
+        for first in range(0,total,128):
+            block=order[first:first+128]
+            for number in block:
+                kind='small' if number<case['small_keys'] else 'big'
+                index=number if kind=='small' else number-case['small_keys']
+                conn.send(*write_args(kind,key(kind,index),payload[0][kind]))
+            await conn.writer.drain()
+            for _ in block: await conn.reply()
+        return
     for kind in ('small','big','hash'):
         n = case[kind+'_keys']
         batch = 1 if kind=='big' else 128
@@ -258,7 +279,9 @@ async def measure(c, conn, directory, resources, payload, action=None):
                 for _ in range(case['pipeline']):
                     state=next_random(state); category=state%10000
                     dataset=case['dataset_id']
-                    if dataset=='big_only': kind='big'
+                    if 'big_request_percent' in case:
+                        kind='big' if category<case['big_request_percent']*100 else 'small'
+                    elif dataset=='big_only': kind='big'
                     elif dataset=='big_heavy': kind='big' if category<9800 else 'small'
                     else:
                         kind='big' if category<2 else 'hash' if category<102 else 'small'
@@ -323,7 +346,13 @@ async def measure(c, conn, directory, resources, payload, action=None):
             left=bounds.get(p,bounds['end'])
             right=bounds.get({'before':'save','save':'after','after':'end','drain':'drain_end'}[p],bounds['end'])
             duration=max(right-left,1e-9)
+            value_bytes = (case['small_bytes'] if kind == 'small' else
+                           case['big_bytes'] if kind == 'big' else
+                           case['hash_field_bytes'] * (case['hash_fields'] if op == 'HSET' else 1)
+                           if kind == 'hash' else 0)
             rows.append(dict(phase=p,operation=op,key_class=kind,seconds=duration,completed=m.completed,
+                             value_payload_bytes=m.completed*value_bytes,
+                             value_payload_mib_per_sec=m.completed*value_bytes/duration/(1024**2),
                              ops_per_sec=m.completed/duration,latency_samples=m.n,p50_ms=m.quantile(.5),
                              p95_ms=m.quantile(.95),p99_ms=m.quantile(.99),p999_ms=m.quantile(.999),max_ms=m.maximum))
         if rows:
@@ -337,14 +366,26 @@ async def measure(c, conn, directory, resources, payload, action=None):
 async def execute(c, out, resources, result):
     case=c['case']; payload=values()
     seed=out/'seed'; seed.mkdir()
-    proc,conn=await start(dict(c,mode='fork'),seed,resources)
-    try:
-        await populate(conn,case,payload)
-        await conn.command('SAVE')
-    finally:
-        await conn.close(); stop_process(proc)
+    cached=Path(c['seed_cache']) if c.get('seed_cache') else None
+    if cached and cached.exists():
+        expected=Path(str(cached)+'.sha256').read_text().strip()
+        if digest(cached)!=expected: raise RuntimeError('Cached seed checksum mismatch')
+        shutil.copyfile(cached,seed/'dump.rdb')
+        result['seed_reused']=True
+    else:
+        proc,conn=await start(dict(c,mode='fork'),seed,resources)
+        try:
+            await populate(conn,case,payload)
+            await conn.command('SAVE')
+        finally:
+            await conn.close(); stop_process(proc)
+        result['seed_reused']=False
     result['seed_sha256']=digest(seed/'dump.rdb')
     result['seed_validation']=await asyncio.wait_for(validate(c,seed,case,payload,True),600)
+    if cached and not cached.exists():
+        cached.parent.mkdir(parents=True,exist_ok=True)
+        shutil.copyfile(seed/'dump.rdb',cached)
+        Path(str(cached)+'.sha256').write_text(result['seed_sha256'])
     injector=None
     if case['lifecycle']=='after_failure':
         injector=(out/'scenario-eio.so').resolve()

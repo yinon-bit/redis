@@ -35,6 +35,20 @@ def performance_cases():
                 validation_timeout_s=600, payload_generator='payload_v1',
                 status='executable_with_deviations',
                 reason='document-cases/1 driver; review recorded deviations from full shared v2.0 compliance.')
+    # Equal logical payload, independently selected request proportions.
+    # Each case is run once per selected build; nine cases x three builds = 27.
+    for dataset, small, big, big_percent in (
+            ('small_only', 16777216, 0, 0),
+            ('big_only', 0, 4096, 100),
+            ('mixed_bytes50', 8388608, 2048, 1)):
+        for workload in ('idle', 'write100', 'read100'):
+            case_id = f'profile.{dataset}.{workload}.ample.cpu6.first.bgsave'
+            base = cases[f'standard.mixed.{workload}.ample.cpu6.first.bgsave'].copy()
+            base.update(case_id=case_id, batch='profile', dataset_id=dataset,
+                        small_keys=small, big_keys=big, hash_keys=0,
+                        repetitions=1, big_request_percent=big_percent,
+                        insertion_order='shuffled_v1', insertion_seed=20260924)
+            cases[case_id] = base
     return cases
 
 

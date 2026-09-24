@@ -137,6 +137,8 @@ int zmallocPtrArenaIndex(void *ptr);
 void zmallocNoTcacheWindowAdd(void *addr, size_t size);
 
 #if defined(USE_JEMALLOC)
+int zmallocArenaCacheInit(unsigned arena);
+int zmallocArenaFlags(unsigned arena);
 void zmalloc_set_thread_flags(int flags);
 int zmalloc_get_thread_flags(void);
 void *zmalloc_with_flags(size_t size, int flags);

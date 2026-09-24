@@ -49,6 +49,9 @@ void forklessEvictionMetadata(unsigned int lru, long long *idle_seconds, int *fr
 void forklessPrioritizeEviction(kvobj *kv);
 unsigned long long forklessPriorityKeys(void);
 sds forklessAppendInfo(sds info);
+/* Diagnostic elapsed time; child encoding includes synchronous output. */
+unsigned long long forklessTimingStart(void);
+void forklessTimingChildEncode(unsigned long long start);
 /* Returns nonzero while detached cleanup work needs another event-loop batch. */
 int forklessReleaseDonePins(void);
 void forklessResetCleanupBudget(void);
@@ -67,6 +70,7 @@ void forklessAbortBeforeFlush(void);
 
 /* Child work and single-writer output. */
 int forklessEmitWork(kvobj *kv, int dbid);
+int forklessChildPumpWork(void);
 void forklessChildSetOutput(rio *rdb);
 int forklessChildFinishStream(rio *rdb);
 const char *forklessChildRdbTmpfile(void);

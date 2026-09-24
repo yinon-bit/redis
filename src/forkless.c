@@ -81,7 +81,7 @@ static struct {
 } forkless_eviction;
 
 /* Pin-table states for keys mutated during the save. Untouched keys never get
- * a pin: only the child work stream authorizes output. */
+ * a pin. Trusted-round pins may be emitted before their child work record. */
 enum {
     FORKLESS_PIN_OBJECT = 1,     /* retained object, waiting to be written */
     FORKLESS_PIN_BYTES,          /* bytes captured before an in-place change */
@@ -96,6 +96,8 @@ typedef struct forklessPin {
     uint8_t held;                /* Main thread must release this reference. */
     uint8_t evicted;             /* Prefer this snapshot once the child confirms it. */
     uint8_t retained_encoding;   /* Frozen on main; do not read live refcount word. */
+    uint8_t early_pending;       /* Identity is still in the bounded early FIFO. */
+    uint8_t awaiting_child;      /* Keep the tombstone until its child record arrives. */
     int state;
     sds encoded;                 /* Encoded key-value pair. */
     sds retained_key;            /* Borrowed while snapshot holds the original string. */
@@ -153,6 +155,16 @@ typedef struct forklessWorkRec {
 static forklessWorkRec forkless_work_batch[FORKLESS_WORK_BATCH_SIZE];
 static size_t forkless_work_batch_count;
 
+/* Only trusted snapshot-start pins enter this bounded queue. Queue entries
+ * contain identities, never pointers into a reallocatable pin-table shard. */
+static forklessWorkRec forkless_early[FORKLESS_WORK_BATCH_SIZE];
+static size_t forkless_early_head, forkless_early_count;
+static int forkless_early_wake[2] = {-1, -1};
+static kvstore **forkless_snapshot_dbs;
+static int forkless_snapshot_dbnum;
+static unsigned char forkless_snapshot_trimmed[CLUSTER_SLOTS / 8];
+static unsigned long long forkless_early_keys;
+
 /* Bounded scheduling window. Only child-confirmed records can enter it: a
  * mutation pin alone may refer to a key created after the fork. All fields
  * below are protected by forkless_mutex. Indices are stored as index + 1. */
@@ -165,7 +177,13 @@ typedef struct forklessReadyKey {
 static forklessReadyKey forkless_ready[FORKLESS_WORK_BATCH_SIZE];
 static unsigned int forkless_ready_index[FORKLESS_WORK_BATCH_SIZE * 2];
 static size_t forkless_ready_count;
+static size_t forkless_ready_remaining;
 static size_t forkless_ready_cursor;
+/* Work-conserving turns: normally 32 records per source. A nearly full
+ * early queue gets up to 64, but can never starve child confirmations. */
+#define FORKLESS_SCHEDULE_QUANTUM 32
+static int forkless_schedule_early;
+static unsigned int forkless_schedule_run;
 static unsigned int forkless_priority_head;
 static unsigned int forkless_priority_tail;
 static unsigned long long forkless_priority_keys;
@@ -211,6 +229,37 @@ static unsigned long long forkless_removed_pins;
 /* Main-thread counters, cumulative for the process lifetime. */
 static unsigned long long forkless_retained_strings, forkless_copied_values;
 static unsigned long long forkless_copy_usec, forkless_reader_wait_usec;
+
+/* Opt-in, cumulative elapsed microseconds. Helper counters are shared with
+ * INFO; child counters live only in the fork and are reported in its log.
+ * These are wall times, not CPU times, and must not be summed across processes. */
+static redisAtomic unsigned long long forkless_helper_encode_usec;
+static redisAtomic unsigned long long forkless_helper_work_wait_usec;
+static redisAtomic unsigned long long forkless_helper_output_usec;
+static unsigned long long forkless_child_encode_usec, forkless_child_input_usec;
+static unsigned long long forkless_child_output_usec;
+static unsigned long long forkless_child_work_wait_usec;
+static size_t (*forkless_child_write)(rio *, const void *, size_t);
+
+static size_t forklessTimedChildWrite(rio *rdb, const void *buf, size_t len) {
+    unsigned long long started = getMonotonicUs();
+    size_t result = forkless_child_write(rdb, buf, len);
+    forkless_child_output_usec += getMonotonicUs() - started;
+    return result;
+}
+
+unsigned long long forklessTimingStart(void) {
+    return server.forkless_timing ? getMonotonicUs() : 0;
+}
+
+void forklessTimingChildEncode(unsigned long long start) {
+    if (start) forkless_child_encode_usec += getMonotonicUs() - start;
+}
+
+static void forklessTimingAdd(redisAtomic unsigned long long *counter,
+                             unsigned long long start) {
+    if (start) atomicIncr(*counter, getMonotonicUs() - start);
+}
 
 /* Separate from forkless_mutex: buffer admission also runs while encoding
  * outside that lock. Never acquire forkless_mutex while holding this mutex.
@@ -325,6 +374,16 @@ static int forklessInitBuffer(rio *r) {
 }
 
 sds forklessAppendInfo(sds info) {
+    unsigned long long encode, work_wait, output;
+    atomicGet(forkless_helper_encode_usec, encode);
+    atomicGet(forkless_helper_work_wait_usec, work_wait);
+    atomicGet(forkless_helper_output_usec, output);
+    info = sdscatprintf(info,
+        "forkless_timing_enabled:%d\r\n"
+        "forkless_helper_encode_usec:%llu\r\n"
+        "forkless_helper_work_wait_usec:%llu\r\n"
+        "forkless_helper_output_usec:%llu\r\n",
+        server.forkless_timing, encode, work_wait, output);
     pthread_mutex_lock(&forkless_memory_mutex);
     size_t snapshot_bytes = forkless_memory_bytes, snapshot_peak = forkless_memory_peak;
     unsigned long long denials = forkless_memory_denials;
@@ -333,6 +392,7 @@ sds forklessAppendInfo(sds info) {
     atomicGet(forkless_retained_bytes, retained);
     pthread_mutex_lock(&forkless_mutex);
     unsigned long long removed = forkless_removed_pins;
+    unsigned long long early = forkless_early_keys;
     size_t records = 0, table_bytes = 0;
     if (forkless_pins) {
         records = forkless_pins->count;
@@ -354,12 +414,13 @@ sds forklessAppendInfo(sds info) {
         "forkless_pin_table_bytes:%zu\r\n"
         "forkless_snapshot_bytes:%zu\r\n"
         "forkless_snapshot_peak:%zu\r\n"
-        "forkless_snapshot_denials:%llu\r\n",
+        "forkless_snapshot_denials:%llu\r\n"
+        "forkless_early_keys:%llu\r\n",
         forkless_retained_strings, forkless_copied_values,
         forkless_copy_usec, forkless_reader_wait_usec,
         forkless_capture_skipped, !forkless_marks_valid,
         retained, forkless_retained_peak, forkless_limit_aborts,
-        removed, records, table_bytes, snapshot_bytes, snapshot_peak, denials);
+        removed, records, table_bytes, snapshot_bytes, snapshot_peak, denials, early);
 }
 
 static int forklessChildRelayFrames(void);
@@ -557,9 +618,19 @@ int forklessInit(void) {
         return C_ERR;
     }
     if (forklessEnsureArena()) {
+#if defined(USE_JEMALLOC)
+        if (server.forkless_arena_tcache && !zmallocArenaCacheInit(forkless_arena_nofork)) {
+            serverLog(LL_WARNING, "Unable to initialize experimental forkless arena cache");
+            return C_ERR;
+        }
+#endif
         /* Arm arena B now. From here the mode may be changed at runtime and
          * only flips visibility; placement decisions are permanent. */
         return forklessSetNoforkForkable(server.bgsave_mode == BGSAVE_MODE_FORK);
+    }
+    if (server.forkless_arena_tcache) {
+        serverLog(LL_WARNING, "forkless-arena-tcache requires initialized jemalloc arenas");
+        return C_ERR;
     }
     if (server.bgsave_mode == BGSAVE_MODE_FORK || server.bgsave_mode == BGSAVE_MODE_FORKLESS) return C_OK;
     serverLog(LL_WARNING, "bgsave-mode %s requires jemalloc",
@@ -683,14 +754,13 @@ static int forklessPinObjectEligible(const kvobj *kv) {
     return kv->type == OBJ_STRING && kv->encoding != OBJ_ENCODING_RAW;
 }
 
-/* MALLOCX_TCACHE_NONE is mandatory, not an optimisation choice: jemalloc's
- * thread cache is not arena aware, so without it MALLOCX_ARENA would only be a
- * hint and a cached region from another arena could be returned instead. */
+/* Automatic tcaches mix arenas. Only the opt-in, dedicated main-thread cache
+ * may be used here; other arenas and threads still bypass caching. */
 static int forklessAllocEnterArena(unsigned int arena) {
 #if defined(USE_JEMALLOC)
     int prev = zmalloc_get_thread_flags();
     if (arena != UINT_MAX)
-        zmalloc_set_thread_flags(MALLOCX_ARENA(arena) | MALLOCX_TCACHE_NONE);
+        zmalloc_set_thread_flags(zmallocArenaFlags(arena));
     return prev;
 #else
     UNUSED(arena);
@@ -759,7 +829,7 @@ static kvobj *forklessMoveKvobjToArena(kvobj *kv) {
     void *old = kvobjGetAllocPtr(kv);
     if (!forklessPtrInArena(old)) {
         size_t sz = zmalloc_usable_size(old);
-        void *n = zmalloc_with_flags(sz, MALLOCX_ARENA(forkless_arena_nofork) | MALLOCX_TCACHE_NONE);
+        void *n = zmalloc_with_flags(sz, zmallocArenaFlags(forkless_arena_nofork));
         memcpy(n, old, sz);
         kvobj *nkv = (kvobj *)((char *)n + ((char *)kv - (char *)old));
         if (nkv->encoding == OBJ_ENCODING_EMBSTR && nkv->ptr)
@@ -992,14 +1062,16 @@ static forklessPin *forklessPinGetOrAddLocked(kvobj *kv) {
     return &shard->slots[slot];
 }
 
-/* A work identity occurs once in the child's frozen dict. After consuming it,
+/* A work identity occurs once in the child's frozen dict. After consuming it
+ * and any queued early reference,
  * normal-round marks prevent recapture of the live/new object. Recovery keeps
  * tombstones because it intentionally ignores those marks. No dangling object
  * dereference is needed to retire an identity. */
 static void forklessPinRemoveWrittenLocked(kvobj *kv) {
     if (!forkless_marks_valid) return;
     forklessPin *pin = forklessPinFindLocked(kv);
-    if (!pin || pin->state != FORKLESS_PIN_WRITTEN) return;
+    if (!pin || pin->state != FORKLESS_PIN_WRITTEN ||
+        pin->early_pending || pin->awaiting_child) return;
     serverAssert(!pin->held && !pin->encoded);
     uint64_t hash = forklessPtrHash(kv);
     forklessPinShard *shard = &forkless_pins->shards[hash & (FORKLESS_PIN_SHARDS - 1)];
@@ -1018,6 +1090,58 @@ static void forklessPinRemoveWrittenLocked(kvobj *kv) {
     forkless_removed_pins++;
     /* Keep capacity until cleanup: reallocating an empty shard on each key
      * would exchange table memory savings for allocator/lock churn. */
+}
+
+/* Main only, before stamping a captured object with this round. Recovering
+ * saves cannot prove membership from marks and must await the child's record.
+ * Follow dictionary identity rather than db->id across SWAPDB. */
+static int forklessEarlyDb(redisDb *db, kvobj *kv) {
+    if (!db || !forkless_snapshot_dbs || !forkless_marks_valid ||
+        kvobjSnapshot(kv) == forkless_round) return -1;
+    if (server.cluster_enabled) {
+        int slot = getKeySlot(kvobjGetKey(kv));
+        if (forkless_snapshot_trimmed[slot / 8] & (1 << (slot % 8))) return -1;
+    }
+    if (db->id < forkless_snapshot_dbnum && forkless_snapshot_dbs[db->id] == db->keys)
+        return db->id;
+    for (int i = 0; i < forkless_snapshot_dbnum; i++)
+        if (forkless_snapshot_dbs[i] == db->keys) return i;
+    return -1;
+}
+
+/* Caller holds forkless_mutex. A full queue falls back to child-driven work;
+ * it never allocates or blocks a client. A wake byte only signals empty->nonempty. */
+static void forklessQueueEarlyLocked(forklessPin *pin, int dbid) {
+    if (dbid < 0 || forkless_early_wake[1] == -1 ||
+        forkless_early_count == FORKLESS_WORK_BATCH_SIZE) return;
+    size_t tail = (forkless_early_head + forkless_early_count) % FORKLESS_WORK_BATCH_SIZE;
+    forkless_early[tail] = (forklessWorkRec){pin->kv, dbid};
+    pin->early_pending = pin->awaiting_child = 1;
+    if (forkless_early_count++ == 0) {
+        ssize_t n;
+        do { n = write(forkless_early_wake[1], "w", 1); } while (n == -1 && errno == EINTR);
+        /* EAGAIN means a previous wake is already readable. */
+        if (n == -1 && errno != EAGAIN && errno != EWOULDBLOCK)
+            atomicSet(forkless_serializer_error, 1);
+    }
+}
+
+static int forklessTakeEarlyLocked(forklessWorkRec *work) {
+    while (forkless_early_count) {
+        *work = forkless_early[forkless_early_head];
+        forkless_early_head = (forkless_early_head + 1) % FORKLESS_WORK_BATCH_SIZE;
+        forkless_early_count--;
+        forklessPin *pin = forklessPinFindLocked(work->kv);
+        serverAssert(pin && pin->early_pending);
+        pin->early_pending = 0;
+        if (pin->state == FORKLESS_PIN_WRITTEN) {
+            /* Child-driven work overtook this queue entry. */
+            forklessPinRemoveWrittenLocked(work->kv);
+            continue;
+        }
+        return 1;
+    }
+    return 0;
 }
 
 /* O(1) expected lookup, with no allocation on the eviction path. A window is
@@ -1066,11 +1190,13 @@ static void forklessPublishReadyLocked(forklessWorkRec *batch, size_t count) {
     memset(forkless_ready, 0, sizeof(forkless_ready));
     memset(forkless_ready_index, 0, sizeof(forkless_ready_index));
     forkless_ready_count = count;
+    forkless_ready_remaining = 0;
     forkless_ready_cursor = 0;
     forkless_priority_head = forkless_priority_tail = 0;
     for (size_t i = 0; i < count; i++) {
         forkless_ready[i].work = batch[i];
         if (!batch[i].kv) continue;
+        forkless_ready_remaining++;
         forkless_ready[i].pending = 1;
         size_t mask = FORKLESS_WORK_BATCH_SIZE * 2 - 1;
         size_t slot = forklessPtrHash(batch[i].kv) & mask;
@@ -1097,7 +1223,29 @@ static int forklessTakeReadyLocked(forklessWorkRec *work) {
         index = forkless_ready_cursor++;
     }
     forkless_ready[index].pending = 0;
+    forkless_ready_remaining--;
     *work = forkless_ready[index].work;
+    return 1;
+}
+
+/* Caller already holds the read-guard mutex: scheduling adds no lock or
+ * allocation. Empty sources donate their turn immediately. */
+static int forklessTakeScheduledLocked(forklessWorkRec *work, int *from_child) {
+    unsigned int quantum = FORKLESS_SCHEDULE_QUANTUM;
+    if (forkless_schedule_early && forkless_early_count >= FORKLESS_WORK_BATCH_SIZE * 3 / 4)
+        quantum *= 2;
+    int early = forkless_schedule_early;
+    if (forkless_schedule_run >= quantum) early = !early;
+    int found = early ? forklessTakeEarlyLocked(work) : forklessTakeReadyLocked(work);
+    if (!found) {
+        early = !early;
+        found = early ? forklessTakeEarlyLocked(work) : forklessTakeReadyLocked(work);
+    }
+    if (!found) return 0;
+    if (early != forkless_schedule_early) forkless_schedule_run = 0;
+    forkless_schedule_early = early;
+    if (forkless_schedule_run < FORKLESS_SCHEDULE_QUANTUM * 2) forkless_schedule_run++;
+    *from_child = !early;
     return 1;
 }
 
@@ -1111,6 +1259,9 @@ static void forklessRetirePins(void) {
     }
     forkless_serializer_kv = NULL;
     forkless_capture_kv = NULL;
+    forkless_early_head = forkless_early_count = 0;
+    forkless_schedule_early = 0;
+    forkless_schedule_run = 0;
     forklessPublishReadyLocked(NULL, 0);
 }
 
@@ -1285,7 +1436,7 @@ static void forklessCaptureAbortLocked(void) {
     server.stat_rdb_consecutive_failures++;
 }
 
-static void forklessCaptureKvInternal(kvobj *kv, int copy_metadata, int retain_string) {
+static void forklessCaptureKvInternal(kvobj *kv, int copy_metadata, int retain_string, redisDb *db) {
     /* Main owns refcounts. A retained original has an extra reference and
      * must still take the lock: its current mark does not permit mutation.
      * With a single reference, a trusted current mark means either a private
@@ -1325,6 +1476,7 @@ static void forklessCaptureKvInternal(kvobj *kv, int copy_metadata, int retain_s
             pthread_mutex_unlock(&forkless_mutex);
             return;
         }
+        int early_dbid = pin ? -1 : forklessEarlyDb(db, kv);
 
         /* Includes retired generations until main releases their references.
          * Admission uses the existing O(1) value allocation estimate. This is
@@ -1365,6 +1517,7 @@ static void forklessCaptureKvInternal(kvobj *kv, int copy_metadata, int retain_s
             pin->retained_encoding = kv->encoding;
             incrRefCount(kv);
             kvobjSetSnapshot(kv, forkless_round);
+            forklessQueueEarlyLocked(pin, early_dbid);
             forkless_retained_strings++;
             forkless_capture_kv = NULL;
             pthread_cond_broadcast(&forkless_read_done);
@@ -1425,6 +1578,7 @@ static void forklessCaptureKvInternal(kvobj *kv, int copy_metadata, int retain_s
         pin->encoded = encoded;
         pin->state = snapshot ? FORKLESS_PIN_OBJECT : FORKLESS_PIN_BYTES;
         kvobjSetSnapshot(kv, forkless_round);
+        forklessQueueEarlyLocked(pin, early_dbid);
         forkless_capture_kv = NULL;
         pthread_cond_broadcast(&forkless_read_done);
         pthread_mutex_unlock(&forkless_mutex);
@@ -1432,10 +1586,10 @@ static void forklessCaptureKvInternal(kvobj *kv, int copy_metadata, int retain_s
     }
 }
 
-static void forklessCaptureKv(kvobj *kv, int copy_metadata, int retain_string) {
+static void forklessCaptureKv(redisDb *db, kvobj *kv, int copy_metadata, int retain_string) {
     mstime_t latency;
     latencyStartMonitor(latency);
-    forklessCaptureKvInternal(kv, copy_metadata, retain_string);
+    forklessCaptureKvInternal(kv, copy_metadata, retain_string, db);
     latencyEndMonitor(latency);
     latencyAddSampleIfNeeded("forkless-capture", latency);
 }
@@ -1445,11 +1599,10 @@ void forklessCaptureFromLink(redisDb *db, dictEntryLink link) {
         if (link) forklessNoForkCapture(db, dictGetKV(*link));
         return;
     }
-    UNUSED(db);
     if (!forkless_save_active || !forklessCaptureEnabled() || !link ||
         !dictEntryIsForkless(*link)) return;
     kvobj *kv = dictGetKV(*link);
-    if (kv) forklessCaptureKv(kv, 0, 0);
+    if (kv) forklessCaptureKv(db, kv, 0, 0);
 }
 
 void forklessCaptureForUnlink(redisDb *db, dictEntryLink link) {
@@ -1457,11 +1610,10 @@ void forklessCaptureForUnlink(redisDb *db, dictEntryLink link) {
         if (link) forklessNoForkCapture(db, dictGetKV(*link));
         return;
     }
-    UNUSED(db);
     if (!forkless_save_active || !forklessCaptureEnabled() || !link ||
         !dictEntryIsForkless(*link)) return;
     kvobj *kv = dictGetKV(*link);
-    if (kv) forklessCaptureKv(kv, 0, 1);
+    if (kv) forklessCaptureKv(db, kv, 0, 1);
 }
 
 /* Module APIs can change metadata even on keys opened read-only. A private
@@ -1478,7 +1630,7 @@ void forklessCaptureMetadata(redisDb *db, kvobj *kv) {
     dictEntryLink link;
     if (dbFindByLink(db, kvobjGetKey(kv), &link) != kv ||
         !dictEntryIsForkless(*link)) return;
-    forklessCaptureKv(kv, 1, 0);
+    forklessCaptureKv(db, kv, 1, 0);
 }
 
 /* ---------- Start one snapshot ---------- */
@@ -1544,6 +1696,18 @@ int forklessSaveBegin(const char *rdb_tmpfile) {
     forklessClosePipePair(forkless_serializer_pipe);
     forklessClosePipePair(forkless_data_pipe);
     forklessClosePipePair(forkless_work_pipe);
+    forklessClosePipePair(forkless_early_wake);
+    forkless_snapshot_dbnum = server.dbnum;
+    forkless_snapshot_dbs = forklessTrackingAlloc(sizeof(*forkless_snapshot_dbs) * forkless_snapshot_dbnum);
+    if (!forkless_snapshot_dbs) goto fail;
+    for (int i = 0; i < forkless_snapshot_dbnum; i++)
+        forkless_snapshot_dbs[i] = server.db[i].keys;
+    memset(forkless_snapshot_trimmed, 0, sizeof(forkless_snapshot_trimmed));
+    if (server.cluster_enabled) {
+        for (int slot = 0; slot < CLUSTER_SLOTS; slot++)
+            if (isSlotInTrimJob(slot)) forkless_snapshot_trimmed[slot / 8] |= 1 << (slot % 8);
+    }
+    if (anetPipe(forkless_early_wake, O_NONBLOCK, O_NONBLOCK) == -1) goto fail;
     if (pipe(forkless_serializer_pipe) == -1) {
         serverLog(LL_WARNING,
                   "forkless: cannot create serializer pipe: %s",
@@ -1574,6 +1738,9 @@ fail:
     forklessClosePipePair(forkless_serializer_pipe);
     forklessClosePipePair(forkless_data_pipe);
     forklessClosePipePair(forkless_work_pipe);
+    forklessClosePipePair(forkless_early_wake);
+    forklessTrackingFree(forkless_snapshot_dbs, sizeof(*forkless_snapshot_dbs) * forkless_snapshot_dbnum);
+    forkless_snapshot_dbs = NULL;
     forkless_rdb_tmp[0] = '\0';
     return C_ERR;
 }
@@ -1638,7 +1805,10 @@ static sds forklessEncodeValue(robj *value, sds name, long long expire, int dbid
     long long idle;
     int freq;
     forklessEvictionMetadata(value->lru, &idle, &freq);
-    if (rdbSaveKeyValuePairWithMetadata(&buffer, &key, value, expire, dbid, idle, freq) == -1) {
+    unsigned long long started = forklessTimingStart();
+    int result = rdbSaveKeyValuePairWithMetadata(&buffer, &key, value, expire, dbid, idle, freq);
+    forklessTimingAdd(&forkless_helper_encode_usec, started);
+    if (result == -1) {
         forklessBufferFree(buffer.io.buffer.ptr);
         return NULL;
     }
@@ -1655,8 +1825,10 @@ static int forklessWriteEncoded(rio *rdb, sds encoded, int dbid) {
     if (!encoded) return C_ERR;
     int status = C_OK;
     uint64_t header[2] = {sdslen(encoded), (uint64_t)dbid};
+    unsigned long long started = forklessTimingStart();
     if (!rioWrite(rdb, header, sizeof(header))) status = C_ERR;
     if (status == C_OK && !rioWrite(rdb, encoded, sdslen(encoded))) status = C_ERR;
+    forklessTimingAdd(&forkless_helper_output_usec, started);
     /* Flush the tail at the end of the bounded work window, before waiting
      * for more child work. Per-key flushing causes millions of tiny writes. */
     forklessRecycleEncoded(encoded);
@@ -1673,8 +1845,9 @@ static void forklessSerializerReadDone(void) {
     pthread_mutex_unlock(&forkless_mutex);
 }
 
-/* Emit one child work record. Only this path may write key bytes.
- * Pins retain mutation snapshots until their matching work record arrives. */
+/* Emit a child work record or a proven snapshot-start pin. Both use the same
+ * encoder and output framing. Early completion keeps an identity tombstone
+ * until the child's frozen dictionary confirms that record. */
 static int forklessSerializerWriteKey(rio *rdb, int *ready)
 {
     for (;;) {
@@ -1684,7 +1857,8 @@ static int forklessSerializerWriteKey(rio *rdb, int *ready)
          * the one value actually being encoded. Eviction priority remains
          * observable between every pair of records. */
         forklessWorkRec work;
-        *ready = forklessTakeReadyLocked(&work);
+        int from_child;
+        *ready = forklessTakeScheduledLocked(&work, &from_child);
         if (!*ready) {
             pthread_mutex_unlock(&forkless_mutex);
             return C_OK;
@@ -1703,8 +1877,14 @@ static int forklessSerializerWriteKey(rio *rdb, int *ready)
         }
 
         forklessPin *pin = forklessPinFindLocked(kv);
+        if (from_child && pin) pin->awaiting_child = 0;
+        if (!from_child) {
+            serverAssert(pin && pin->awaiting_child);
+            forkless_early_keys++;
+        }
         if (pin) {
             if (pin->state == FORKLESS_PIN_WRITTEN) {
+                forklessPinRemoveWrittenLocked(kv);
                 pthread_mutex_unlock(&forkless_mutex);
                 return C_OK;
             }
@@ -1783,6 +1963,40 @@ static int forklessConsumeWorkStream(rio *rdb) {
     size_t buffered = 0;
 
     while (1) {
+        /* Bound each turn so early traffic cannot starve child pipe reads. */
+        for (size_t i = 0; i < FORKLESS_WORK_BATCH_SIZE; i++) {
+            if (forklessSerializerFailed()) return C_ERR;
+            int ready;
+            if (forklessSerializerWriteKey(rdb, &ready) == C_ERR) return C_ERR;
+            if (!ready) break;
+        }
+        /* The child may be waiting for a frame tail before sending more work.
+         * Flush before sleeping, not once per key. */
+        unsigned long long started = forklessTimingStart();
+        int flush_error = fflush(rdb->io.file.fp);
+        forklessTimingAdd(&forkless_helper_output_usec, started);
+        if (flush_error) return C_ERR;
+        pthread_mutex_lock(&forkless_mutex);
+        int pending = forkless_early_count != 0;
+        int child_pending = forkless_ready_remaining != 0;
+        pthread_mutex_unlock(&forkless_mutex);
+        /* Interleaving can leave child records in the current window. Never
+         * replace that window or accept EOF until all of them are consumed. */
+        if (child_pending) continue;
+        struct pollfd fds[2] = {
+            {.fd = forkless_work_pipe[0], .events = POLLIN},
+            {.fd = forkless_early_wake[0], .events = POLLIN}
+        };
+        int polled;
+        started = pending ? 0 : forklessTimingStart();
+        do { polled = poll(fds, 2, pending ? 0 : -1); } while (polled == -1 && errno == EINTR);
+        forklessTimingAdd(&forkless_helper_work_wait_usec, started);
+        if (polled == -1) return C_ERR;
+        if (fds[1].revents & POLLIN) {
+            char wake[128];
+            while (read(forkless_early_wake[0], wake, sizeof(wake)) > 0) {}
+        }
+        if (!(fds[0].revents & (POLLIN | POLLHUP | POLLERR))) continue;
         /* Only an incomplete record may carry over between reads. */
         if (buffered >= sizeof(*batch)) return C_ERR;
         char *next = (char *)batch + buffered;
@@ -1799,19 +2013,10 @@ static int forklessConsumeWorkStream(rio *rdb) {
         pthread_mutex_lock(&forkless_mutex);
         forklessPublishReadyLocked(batch, count);
         pthread_mutex_unlock(&forkless_mutex);
-        while (1) {
-            if (forklessSerializerFailed()) return C_ERR;
-            int ready;
-            if (forklessSerializerWriteKey(rdb, &ready) == C_ERR) return C_ERR;
-            if (!ready) break;
-        }
 
         buffered %= sizeof(*batch);
         if (buffered)
             memmove(batch, (char *)batch + count * sizeof(*batch), buffered);
-        /* The child may be waiting for a frame tail before it can send more
-         * work. Never block on the work pipe with output left in stdio. */
-        if (fflush(rdb->io.file.fp)) return C_ERR;
     }
 }
 
@@ -1850,9 +2055,11 @@ static void *forklessSerializerMain(void *arg) {
     forkless_encode_scratch = NULL;
     forkless_reuse_buffer = 0;
 
+    unsigned long long output_started = forklessTimingStart();
     if (fflush(fp))
         atomicSet(forkless_serializer_error, 1);
     if (fclose(fp)) atomicSet(forkless_serializer_error, 1);
+    forklessTimingAdd(&forkless_helper_output_usec, output_started);
     forkless_data_pipe[1] = -1;
 
     forklessCloseFd(&forkless_work_pipe[0]);
@@ -1906,6 +2113,9 @@ typedef struct forklessFrameReader {
     size_t end;
 } forklessFrameReader;
 
+/* Child-owned: preserve prefetched bytes when yielding at a frame boundary. */
+static forklessFrameReader forkless_child_reader;
+
 /* Read whatever is available, not an entire buffer's worth. Waiting for a
  * full buffer could deadlock with the helper waiting for more work from us.
  * Only wait inside a frame: returning mid-frame would let child-owned RDB
@@ -1914,7 +2124,9 @@ typedef struct forklessFrameReader {
 static ssize_t forklessFrameReaderFill(forklessFrameReader *reader, int fd, int wait) {
     if (reader->pos < reader->end) return reader->end - reader->pos;
     while (1) {
+        unsigned long long started = forklessTimingStart();
         ssize_t n = read(fd, reader->buf, sizeof(reader->buf));
+        if (started) forkless_child_input_usec += getMonotonicUs() - started;
         if (n >= 0) {
             reader->pos = 0;
             reader->end = n;
@@ -1923,31 +2135,37 @@ static ssize_t forklessFrameReaderFill(forklessFrameReader *reader, int fd, int 
         if (n == -1 && errno == EINTR) continue;
         if (wait && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             struct pollfd pfd = {.fd = fd, .events = POLLIN};
-            if (poll(&pfd, 1, -1) == -1 && errno != EINTR) return -1;
+            started = forklessTimingStart();
+            int polled = poll(&pfd, 1, -1);
+            if (started) forkless_child_input_usec += getMonotonicUs() - started;
+            if (polled == -1 && errno != EINTR) return -1;
             continue;
         }
         return -1;
     }
 }
 
-static int forklessChildRelayFrames(void) {
+static int forklessChildRelayFramesLimited(size_t frame_limit) {
     if (forkless_data_pipe[0] == -1) return C_OK;
     if (!forkless_child_rio) return C_OK;
 
-    forklessFrameReader reader;
-    reader.pos = reader.end = 0;
+    forklessFrameReader *reader = &forkless_child_reader;
+    size_t frames = 0;
     while (1) {
+        /* Yield only between complete RDB records; keep prefetched bytes. */
+        if (frame_limit && frames >= frame_limit)
+            return C_OK;
         uint64_t header[2];
-        ssize_t n = forklessFrameReaderFill(&reader, forkless_data_pipe[0], 0);
+        ssize_t n = forklessFrameReaderFill(reader, forkless_data_pipe[0], 0);
         if (n > 0) {
             size_t copied = 0;
             while (copied < sizeof(header)) {
-                n = forklessFrameReaderFill(&reader, forkless_data_pipe[0], 1);
+                n = forklessFrameReaderFill(reader, forkless_data_pipe[0], 1);
                 if (n <= 0) return C_ERR; /* Truncated header. */
                 size_t take = sizeof(header) - copied;
                 if (take > (size_t)n) take = n;
-                memcpy((char *)header + copied, reader.buf + reader.pos, take);
-                reader.pos += take;
+                memcpy((char *)header + copied, reader->buf + reader->pos, take);
+                reader->pos += take;
                 copied += take;
             }
             if (header[1] >= (uint64_t)server.dbnum) return C_ERR;
@@ -1955,13 +2173,14 @@ static int forklessChildRelayFrames(void) {
                 rdbSaveLen(forkless_child_rio, header[1]) == -1) return C_ERR;
             uint64_t left = header[0];
             while (left) {
-                n = forklessFrameReaderFill(&reader, forkless_data_pipe[0], 1);
+                n = forklessFrameReaderFill(reader, forkless_data_pipe[0], 1);
                 if (n <= 0) return C_ERR; /* Truncated payload. */
                 size_t take = left > (uint64_t)n ? (size_t)n : (size_t)left;
-                if (!rioWrite(forkless_child_rio, reader.buf + reader.pos, take)) return C_ERR;
-                reader.pos += take;
+                if (!rioWrite(forkless_child_rio, reader->buf + reader->pos, take)) return C_ERR;
+                reader->pos += take;
                 left -= take;
             }
+            frames++;
             continue;
         }
         if (n == -1 && errno == EINTR) continue;
@@ -1974,10 +2193,15 @@ static int forklessChildRelayFrames(void) {
     }
 }
 
+static int forklessChildRelayFrames(void) {
+    return forklessChildRelayFramesLimited(0);
+}
+
 static void forklessChildPreparePipes(void) {
     if (forkless_work_pipe[0] == -1) return;
 
     forklessCloseFd(&forkless_work_pipe[0]);
+    forklessClosePipePair(forkless_early_wake);
 
     if (forklessStreamActive()) {
         int flags = fcntl(forkless_work_pipe[1], F_GETFL, 0);
@@ -2007,7 +2231,7 @@ static int forklessChildWriteWork(const void *buf, size_t len) {
         if (n == -1 && errno == EINTR) continue;
         if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             if (forklessStreamActive()) {
-                if (forklessChildRelayFrames() == C_ERR) return C_ERR;
+                if (forklessChildRelayFramesLimited(32) == C_ERR) return C_ERR;
                 struct pollfd pfd[2];
                 int nfds = 1;
                 pfd[0].fd = forkless_work_pipe[1];
@@ -2017,11 +2241,16 @@ static int forklessChildWriteWork(const void *buf, size_t len) {
                     pfd[1].events = POLLIN;
                     nfds = 2;
                 }
+                unsigned long long started = forklessTimingStart();
                 poll(pfd, nfds, 10);
+                if (started) forkless_child_work_wait_usec += getMonotonicUs() - started;
                 continue;
             }
             struct pollfd pfd = { .fd = forkless_work_pipe[1], .events = POLLOUT };
-            if (poll(&pfd, 1, -1) == -1 && errno != EINTR) return C_ERR;
+            unsigned long long started = forklessTimingStart();
+            int polled = poll(&pfd, 1, -1);
+            if (started) forkless_child_work_wait_usec += getMonotonicUs() - started;
+            if (polled == -1 && errno != EINTR) return C_ERR;
             continue;
         }
         return C_ERR;
@@ -2035,6 +2264,14 @@ static int forklessChildFlushWork(void) {
     int status = forklessChildWriteWork(forkless_work_batch, bytes);
     forkless_work_batch_count = 0;
     return status;
+}
+
+/* Send even a partial batch before encoding a child-owned key. Service the
+ * return pipe too, but give child-owned keys a turn under continuous output. */
+int forklessChildPumpWork(void) {
+    forklessChildPreparePipes();
+    if (forklessChildFlushWork() == C_ERR) return C_ERR;
+    return forklessChildRelayFramesLimited(32);
 }
 
 int forklessEmitWork(kvobj *kv, int dbid) {
@@ -2072,6 +2309,11 @@ static char forklessChildReadStatus(char error_status) {
 }
 void forklessChildSetOutput(rio *rdb) {
     forkless_child_rio = rdb;
+    if (server.forkless_timing && rdb->write != forklessTimedChildWrite) {
+        forkless_child_write = rdb->write;
+        rdb->write = forklessTimedChildWrite;
+    }
+    forkless_child_reader.pos = forkless_child_reader.end = 0;
 }
 
 int forklessChildFinishStream(rio *rdb) {
@@ -2091,6 +2333,11 @@ int forklessChildFinishStream(rio *rdb) {
     forkless_child_rio = NULL;
 
     char status = forklessChildReadStatus(FORKLESS_STATUS_ERR);
+    if (server.forkless_timing)
+        serverLog(LL_NOTICE, "Hybrid timing: child_encode_with_output_usec=%llu child_helper_input_usec=%llu child_output_usec=%llu child_work_wait_usec=%llu status=%c",
+                  forkless_child_encode_usec, forkless_child_input_usec,
+                  forkless_child_output_usec, forkless_child_work_wait_usec, status);
+    if (rdb->write == forklessTimedChildWrite) rdb->write = forkless_child_write;
     return retval == C_OK && status == FORKLESS_STATUS_OK ? C_OK : C_ERR;
 }
 
@@ -2136,6 +2383,9 @@ void forklessSaveCleanup(void) {
     forklessClosePipePair(forkless_work_pipe);
 
     forklessRetirePins();
+    forklessClosePipePair(forkless_early_wake);
+    forklessTrackingFree(forkless_snapshot_dbs, sizeof(*forkless_snapshot_dbs) * forkless_snapshot_dbnum);
+    forkless_snapshot_dbs = NULL;
 
     if (forkless_save_active && server.active_defrag_paused > 0)
         server.active_defrag_paused--;
@@ -2765,11 +3015,14 @@ static int forklessTestRelay(const void *bytes, size_t len, size_t chunk, sds ex
     serverAssert(pipe(forkless_data_pipe) == 0);
     rio output;
     rioInitWithBuffer(&output, sdsempty());
-    forkless_child_rio = &output;
+    forklessChildSetOutput(&output);
     forklessTestFrameWriter writer = {forkless_data_pipe[1], bytes, len, chunk};
     pthread_t tid;
     serverAssert(pthread_create(&tid, NULL, forklessTestWriteFrames, &writer) == 0);
-    int result = forklessChildRelayFrames();
+    int result;
+    do {
+        result = forklessChildRelayFramesLimited(32);
+    } while (result == C_OK && forkless_data_pipe[0] != -1);
     pthread_join(tid, NULL);
     forklessCloseFd(&forkless_data_pipe[0]);
     forkless_data_pipe[1] = -1; /* Closed by writer. */
@@ -2797,10 +3050,28 @@ static void forklessTestBufferedFrames(void) {
         rdbSaveLen(&expected, header[1]);
         rioWrite(&expected, payload, header[0]);
     }
-    test_cond("Buffered relay preserves many frames, large payloads and DB selection",
+    test_cond("Bounded relay resumes prefetched frames, large payloads and DB selection",
               forklessTestRelay(frames, sdslen(frames), 65536, expected.io.buffer.ptr, C_OK));
     test_cond("Buffered relay preserves fragmented headers and payloads",
               forklessTestRelay(frames, sdslen(frames), 7, expected.io.buffer.ptr, C_OK));
+    serverAssert(pipe(forkless_data_pipe) == 0);
+    rio bounded;
+    rioInitWithBuffer(&bounded, sdsempty());
+    forklessChildSetOutput(&bounded);
+    /* Three 23-byte frames fit in one read. Stop after one even though the
+     * reader has already prefetched the other two. */
+    serverAssert(write(forkless_data_pipe[1], frames, 69) == 69);
+    test_cond("Relay yields exactly at its frame budget with buffered input",
+              forklessChildRelayFramesLimited(1) == C_OK &&
+              sdslen(bounded.io.buffer.ptr) == 9 &&
+              forkless_child_reader.pos < forkless_child_reader.end);
+    forklessCloseFd(&forkless_data_pipe[1]);
+    test_cond("Relay resumes buffered input without losing or duplicating records",
+              forklessChildRelayFrames() == C_OK &&
+              sdslen(bounded.io.buffer.ptr) == 27 &&
+              !memcmp(bounded.io.buffer.ptr, expected.io.buffer.ptr, 27));
+    forkless_child_rio = NULL;
+    sdsfree(bounded.io.buffer.ptr);
     sdsfree(frames);
     sdsfree(expected.io.buffer.ptr);
     uint64_t header[2] = {10, 0};
@@ -2816,7 +3087,7 @@ static void forklessTestBufferedFrames(void) {
     serverAssert(fcntl(forkless_data_pipe[0], F_SETFL, flags | O_NONBLOCK) == 0);
     rio output;
     rioInitWithBuffer(&output, sdsempty());
-    forkless_child_rio = &output;
+    forklessChildSetOutput(&output);
     test_cond("Buffered relay yields on an empty nonblocking pipe without closing it",
               forklessChildRelayFrames() == C_OK && forkless_data_pipe[0] != -1 &&
               sdslen(output.io.buffer.ptr) == 0);
@@ -2832,6 +3103,103 @@ static forklessPin *forklessTestPinAdd(kvobj *kv) {
     forklessPin *pin = forklessPinGetOrAddLocked(kv);
     pthread_mutex_unlock(&forkless_mutex);
     return pin;
+}
+
+static void forklessTestEarlyPins(void) {
+    kvobj keys[FORKLESS_WORK_BATCH_SIZE + 1] = {{0}};
+    forklessWorkRec work;
+    int saved_marks = forkless_marks_valid;
+    forkless_marks_valid = 1;
+    serverAssert(anetPipe(forkless_early_wake, O_NONBLOCK, O_NONBLOCK) == 0);
+    for (size_t i = 0; i <= FORKLESS_WORK_BATCH_SIZE; i++) {
+        forklessPin *p = forklessTestPinAdd(&keys[i]);
+        p->state = FORKLESS_PIN_OBJECT;
+        pthread_mutex_lock(&forkless_mutex);
+        forklessQueueEarlyLocked(p, 7);
+        pthread_mutex_unlock(&forkless_mutex);
+    }
+    test_cond("Early queue stays bounded and overflow falls back to child work",
+              forkless_early_count == FORKLESS_WORK_BATCH_SIZE &&
+              !forklessPinFindLocked(&keys[FORKLESS_WORK_BATCH_SIZE])->early_pending);
+    pthread_mutex_lock(&forkless_mutex);
+    test_cond("Early dequeue preserves identity and original database",
+              forklessTakeEarlyLocked(&work) && work.kv == &keys[0] && work.dbid == 7);
+    forklessPin *p = forklessPinFindLocked(&keys[0]);
+    p->state = FORKLESS_PIN_WRITTEN;
+    forklessPinRemoveWrittenLocked(&keys[0]);
+    test_cond("Early tombstone survives until child confirmation",
+              forklessPinFindLocked(&keys[0]) == p);
+    p->awaiting_child = 0;
+    forklessPinRemoveWrittenLocked(&keys[0]);
+    test_cond("Child confirmation retires an early tombstone",
+              !forklessPinFindLocked(&keys[0]));
+    p = forklessPinFindLocked(&keys[1]);
+    p->state = FORKLESS_PIN_WRITTEN;
+    p->awaiting_child = 0;
+    forklessPinRemoveWrittenLocked(&keys[1]);
+    test_cond("Child-first completion keeps identity while still queued",
+              forklessPinFindLocked(&keys[1]) == p);
+    test_cond("Dequeuing child-first completion skips output and retires it",
+              forklessTakeEarlyLocked(&work) && work.kv == &keys[2] &&
+              !forklessPinFindLocked(&keys[1]));
+    pthread_mutex_unlock(&forkless_mutex);
+    forklessRetirePins();
+    forklessClosePipePair(forkless_early_wake);
+    while (forkless_retired_pins) {
+        forklessResetCleanupBudget();
+        forklessReleaseDonePins();
+    }
+    forkless_marks_valid = saved_marks;
+    test_cond("Early queue cleanup releases all tracking charges", forkless_memory_bytes == 0);
+}
+
+static void forklessTestScheduling(void) {
+    kvobj keys[FORKLESS_WORK_BATCH_SIZE * 2] = {{0}};
+    forklessWorkRec batch[FORKLESS_WORK_BATCH_SIZE], work;
+    serverAssert(anetPipe(forkless_early_wake, O_NONBLOCK, O_NONBLOCK) == 0);
+    for (size_t i = 0; i < FORKLESS_WORK_BATCH_SIZE; i++) {
+        forklessPin *pin = forklessTestPinAdd(&keys[i]);
+        pin->state = FORKLESS_PIN_OBJECT;
+        pthread_mutex_lock(&forkless_mutex);
+        forklessQueueEarlyLocked(pin, 0);
+        pthread_mutex_unlock(&forkless_mutex);
+        batch[i] = (forklessWorkRec){&keys[FORKLESS_WORK_BATCH_SIZE + i], 0};
+    }
+    pthread_mutex_lock(&forkless_mutex);
+    forklessPublishReadyLocked(batch, FORKLESS_WORK_BATCH_SIZE);
+    int from_child, correct = 1;
+    size_t children = 0, early = 0;
+    for (size_t i = 0; i < FORKLESS_WORK_BATCH_SIZE * 2; i++) {
+        if (!forklessTakeScheduledLocked(&work, &from_child)) {correct = 0; break;}
+        if (from_child) {
+            if (work.kv != &keys[FORKLESS_WORK_BATCH_SIZE + children++]) correct = 0;
+        } else {
+            if (work.kv != &keys[early++]) correct = 0;
+        }
+        if (i == 31)
+            test_cond("Scheduler starts with 32 child records", children == 32 && early == 0);
+        if (i == 95)
+            test_cond("Full early queue receives 64 records before returning to child",
+                      children == 32 && early == 64);
+        if (i == 255)
+            test_cond("Mixed turn retains unfinished child window", forkless_ready_remaining > 0);
+    }
+    test_cond("Scheduler drains both sources exactly once without reordering them",
+              correct && children == FORKLESS_WORK_BATCH_SIZE && early == FORKLESS_WORK_BATCH_SIZE);
+    test_cond("Scheduler reports no work after both queues drain",
+              !forklessTakeScheduledLocked(&work, &from_child) && !forkless_ready_remaining);
+    forklessPublishReadyLocked(batch, 2);
+    test_cond("An empty early queue immediately donates its turn to child work",
+              forklessTakeScheduledLocked(&work, &from_child) && from_child &&
+              forklessTakeScheduledLocked(&work, &from_child) && from_child);
+    pthread_mutex_unlock(&forkless_mutex);
+    forklessRetirePins();
+    forklessClosePipePair(forkless_early_wake);
+    while (forkless_retired_pins) {
+        forklessResetCleanupBudget();
+        forklessReleaseDonePins();
+    }
+    test_cond("Scheduling cleanup releases all tracking charges", forkless_memory_bytes == 0);
 }
 
 int forklessTest(int argc, char **argv, int flags) {
@@ -2930,22 +3298,22 @@ int forklessTest(int argc, char **argv, int flags) {
     /* Holding the mutex here proves that the completed/unshared path no
      * longer attempts to acquire it. This test runs without a helper. */
     pthread_mutex_lock(&forkless_mutex);
-    forklessCaptureKvInternal(progress, 0, 0);
+    forklessCaptureKvInternal(progress, 0, 0, NULL);
     pthread_mutex_unlock(&forkless_mutex);
     test_cond("Completed untouched object needs no pin",
               kvobjSnapshot(progress) == forkless_round && !forklessPinFindLocked(progress));
     test_cond("Completed unshared capture bypasses the snapshot mutex",
               forkless_capture_skipped == skips_before + 1);
     forkless_round = forkless_round == 1 ? 2 : 1;
-    forklessCaptureKvInternal(progress, 0, 1);
+    forklessCaptureKvInternal(progress, 0, 1, NULL);
     test_cond("Previous round completion still needs capturing",
               forklessPinFindLocked(progress) && progress->refcount == 2);
-    forklessCaptureKvInternal(progress, 0, 0);
+    forklessCaptureKvInternal(progress, 0, 0, NULL);
     test_cond("Current progress mark does not bypass retained-value detachment",
               forklessPinFindLocked(progress)->snapshot != progress && progress->refcount == 1);
     kvobj *private_snapshot = forklessPinFindLocked(progress)->snapshot;
     pthread_mutex_lock(&forkless_mutex);
-    forklessCaptureKvInternal(progress, 1, 0);
+    forklessCaptureKvInternal(progress, 1, 0, NULL);
     pthread_mutex_unlock(&forkless_mutex);
     test_cond("Private snapshot permits repeated metadata changes without recapture",
               forklessPinFindLocked(progress)->snapshot == private_snapshot);
@@ -2955,7 +3323,7 @@ int forklessTest(int argc, char **argv, int flags) {
         forklessReleaseDonePins();
     }
     forkless_marks_valid = 0;
-    forklessCaptureKvInternal(progress, 0, 0);
+    forklessCaptureKvInternal(progress, 0, 0, NULL);
     test_cond("Recovery ignores a current-round mark",
               forklessPinFindLocked(progress) != NULL);
     decrRefCount(progress);
@@ -3080,6 +3448,8 @@ int forklessTest(int argc, char **argv, int flags) {
     zfree(many);
     test_cond("Retired tracking generations release their admission charges",
               forkless_memory_bytes == 0);
+    forklessTestEarlyPins();
+    forklessTestScheduling();
 
     /* Retain a RAW replacement without copying; a later in-place mutation
      * must upgrade that same pin to a private snapshot. */
@@ -3087,11 +3457,11 @@ int forklessTest(int argc, char **argv, int flags) {
     robj *raw = createRawStringObject("original", 8);
     kvobj *original = kvobjSet(rawkey, raw, 0);
     sdsfree(rawkey);
-    forklessCaptureKvInternal(original, 0, 1);
+    forklessCaptureKvInternal(original, 0, 1, NULL);
     pin = forklessPinFindLocked(original);
     test_cond("Replacement retains RAW string instead of copying",
               pin && pin->snapshot == original && original->refcount == 2);
-    forklessCaptureKvInternal(original, 0, 0);
+    forklessCaptureKvInternal(original, 0, 0, NULL);
     pin = forklessPinFindLocked(original);
     test_cond("In-place capture detaches a previously retained RAW string",
               pin && pin->snapshot != original && original->refcount == 1 &&

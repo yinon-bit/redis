@@ -22,3 +22,4 @@ tools/forkless-benchmark/test-aws-auto.py
 tools/forkless-benchmark/test-scenario-runner.py
 tools/forkless-benchmark/test-spec-worker.py
 tools/forkless-benchmark/test-fixture-worker.py
+tools/forkless-benchmark/seed-cache.py
