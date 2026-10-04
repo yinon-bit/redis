@@ -135,6 +135,8 @@ int zmallocPtrArenaIndex(void *ptr);
 /* Register an extent whose memory must never enter a shared thread cache.
  * Must be called before the memory is handed out. See zmalloc.c for why. */
 void zmallocNoTcacheWindowAdd(void *addr, size_t size);
+/* Conservative exclusion test only: true does NOT prove arena ownership. */
+int zmallocMayBeNoFork(const void *ptr);
 
 #if defined(USE_JEMALLOC)
 int zmallocArenaCacheInit(unsigned arena);

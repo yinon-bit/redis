@@ -23,4 +23,28 @@ start_server {tags {forkless bgsave} overrides {save {} bgsave-mode fork forkles
             r flushdb async
         }
     }
+
+    test {arena cache preserves payloads across repeated raw string replacements} {
+        r config set bgsave-mode hybrid
+        r flushdb
+        for {set i 0} {$i < 100} {incr i} {
+            r set replace:$i [string repeat a 256] PX 600000
+        }
+        for {set round 0} {$round < 4} {incr round} {
+            set payload [string repeat [format %c [expr {98 + $round}]] [expr {256 + 64 * $round}]]
+            r bgsave
+            for {set i 0} {$i < 100} {incr i} {
+                r set replace:$i $payload KEEPTTL
+                assert_equal $payload [r get replace:$i]
+                assert {[r pttl replace:$i] > 0}
+            }
+            waitForBgsave r
+            assert_equal ok [status r rdb_last_bgsave_status]
+        }
+        set expected [debug_digest]
+        r bgsave
+        waitForBgsave r
+        r debug reload nosave
+        assert_equal $expected [debug_digest]
+    }
 }

@@ -350,6 +350,10 @@ void zmallocNoTcacheWindowAdd(void *addr, size_t size) {
 #define zmallocNoTcachePtr(ptr) (0)
 #endif
 
+int zmallocMayBeNoFork(const void *ptr) {
+    UNUSED(ptr); /* The non-jemalloc predicate is constant false. */
+    return ptr != NULL && zmallocNoTcachePtr(ptr);
+}
 
 #ifdef HAVE_MALLOC_SIZE
 void *extend_to_usable(void *ptr, size_t size) {
@@ -434,11 +438,29 @@ void *zmalloc_usable(size_t size, size_t *usable) {
 }
 
 #if defined(USE_JEMALLOC)
+/* Cache only the control identifier, never pointer ownership: freed addresses
+ * can be reused by another arena. pthread_once publishes the immutable MIB to
+ * allocator callers on every thread. Keep the named lookup as a fallback. */
+static pthread_once_t arena_lookup_once = PTHREAD_ONCE_INIT;
+static size_t arena_lookup_mib[2];
+static size_t arena_lookup_mib_len = 2;
+static int arena_lookup_mib_error;
+
+static void zmallocInitArenaLookup(void) {
+    arena_lookup_mib_error = je_mallctlnametomib("arenas.lookup",
+        arena_lookup_mib, &arena_lookup_mib_len);
+}
+
 int zmallocPtrArenaIndex(void *ptr) {
     if (ptr == NULL) return -1;
+    pthread_once(&arena_lookup_once, zmallocInitArenaLookup);
     unsigned arena = 0;
     size_t size = sizeof(arena);
-    if (je_mallctl("arenas.lookup", &arena, &size, &ptr, sizeof(ptr)) != 0)
+    int result = arena_lookup_mib_error ?
+        je_mallctl("arenas.lookup", &arena, &size, &ptr, sizeof(ptr)) :
+        je_mallctlbymib(arena_lookup_mib, arena_lookup_mib_len,
+                       &arena, &size, &ptr, sizeof(ptr));
+    if (result != 0)
         return -1;
     return (int)arena;
 }
@@ -1472,6 +1494,9 @@ size_t zmalloc_get_memory_size(void) {
 static void *zmallocCacheTestWorker(void *arg) {
     unsigned arena = *(unsigned *)arg;
     assert(zmallocArenaFlags(arena) == (MALLOCX_ARENA(arena) | MALLOCX_TCACHE_NONE));
+    void *ptr = zmalloc_with_flags(128, zmallocArenaFlags(arena));
+    assert(zmallocPtrArenaIndex(ptr) == (int)arena);
+    zfree(ptr);
     return NULL;
 }
 #endif
@@ -1492,6 +1517,14 @@ int zmalloc_test(int argc, char **argv, int flags) {
     TEST("Allocated 123 bytes") {
         ptr = zmalloc(123);
         printf("Allocated 123 bytes; used: %zu\n", zmalloc_used_memory());
+#ifdef USE_JEMALLOC
+        unsigned expected;
+        size_t len = sizeof(expected);
+        assert(je_mallctl("arenas.lookup", &expected, &len, &ptr, sizeof(ptr)) == 0);
+        assert(zmallocPtrArenaIndex(ptr) == (int)expected);
+        assert(arena_lookup_mib_error == 0);
+        assert(zmallocPtrArenaIndex(NULL) == -1);
+#endif
     }
 
     TEST("Reallocated to 456 bytes") {
@@ -1518,15 +1551,25 @@ int zmalloc_test(int argc, char **argv, int flags) {
 
 #ifdef USE_JEMALLOC
     TEST("Dedicated arena cache never mixes default and arena allocations") {
+        assert(!zmallocMayBeNoFork(NULL));
+        assert(!zmallocMayBeNoFork((void *)(uintptr_t)1));
         unsigned arena;
         size_t len = sizeof(arena);
         assert(je_mallctl("arenas.create", &arena, &len, NULL, 0) == 0);
         assert(zmallocArenaCacheInit(arena));
         assert(zmallocArenaFlags(arena) != (MALLOCX_ARENA(arena) | MALLOCX_TCACHE_NONE));
+        /* A conservative window may include foreign allocations. Membership
+         * must never replace the exact arena check for cache admission. */
+        ptr2 = zmalloc(128);
+        zmallocNoTcacheWindowAdd(ptr2, zmalloc_size(ptr2));
+        assert(zmallocMayBeNoFork(ptr2));
+        assert(zmallocPtrArenaIndex(ptr2) != (int)arena);
+        zfree(ptr2);
         for (int i = 0; i < 2000; i++) {
             ptr = zmalloc_with_flags(128, zmallocArenaFlags(arena));
             assert(zmallocPtrArenaIndex(ptr) == (int)arena);
             zmallocNoTcacheWindowAdd(ptr, zmalloc_size(ptr));
+            assert(zmallocMayBeNoFork(ptr));
             if (i % 3 == 0) zfree(ptr);
             else if (i % 3 == 1) zfree_usable(ptr, NULL);
             else zfree_with_size(ptr, zmalloc_size(ptr));

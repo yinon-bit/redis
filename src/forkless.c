@@ -824,10 +824,10 @@ static void forklessDupPayloadInPlace(robj *val) {
 }
 
 #if defined(USE_JEMALLOC)
-static kvobj *forklessMoveKvobjToArena(kvobj *kv) {
+static kvobj *forklessMoveKvobjToArena(kvobj *kv, int header_in_arena, int duplicate_payload) {
     if (!forklessArenasReady() || kv == NULL) return kv;
     void *old = kvobjGetAllocPtr(kv);
-    if (!forklessPtrInArena(old)) {
+    if (!header_in_arena) {
         size_t sz = zmalloc_usable_size(old);
         void *n = zmalloc_with_flags(sz, zmallocArenaFlags(forkless_arena_nofork));
         memcpy(n, old, sz);
@@ -838,13 +838,15 @@ static kvobj *forklessMoveKvobjToArena(kvobj *kv) {
         kv = nkv;
     }
     int prev = forklessAllocEnter();
-    if (forklessPayloadNeedsDup(kv))
+    if (duplicate_payload)
         forklessDupPayloadInPlace(kv);
     forklessAllocLeave(prev);
     return kv;
 }
 #else
-static kvobj *forklessMoveKvobjToArena(kvobj *kv) {
+static kvobj *forklessMoveKvobjToArena(kvobj *kv, int header_in_arena, int duplicate_payload) {
+    UNUSED(header_in_arena);
+    UNUSED(duplicate_payload);
     return kv;
 }
 #endif
@@ -934,17 +936,18 @@ void forklessFinalizeDbValue(redisDb *db, robj *key, kvobj **kvp,
     int slot = getKeySlot(key->ptr);
     int route = !getModuleMetaBits(kvobjMetaBits(kv)) &&
                 forklessValueIsEligible(kv);
-    int touch = route ?
-                (!forklessPtrInArena(kvobjGetAllocPtr(kv)) ||
-                 forklessPayloadNeedsDup(kv)) :
-                forklessPtrInArena(kvobjGetAllocPtr(kv));
+    /* Decide placement once. No client mutation can intervene before the
+     * move, and relocating the header does not move an external payload. */
+    int header_in_arena = forklessPtrInArena(kvobjGetAllocPtr(kv));
+    int duplicate_payload = route && forklessPayloadNeedsDup(kv);
+    int touch = route ? (!header_in_arena || duplicate_payload) : header_in_arena;
     uint64_t subexpiry = EB_EXPIRE_TIME_INVALID;
     if (touch && kv->type == OBJ_HASH)
         subexpiry = estoreRemove(db->subexpires, slot, kv);
 
     kvobj *moved = kv;
-    if (route) {
-        moved = forklessMoveKvobjToArena(kv);
+    if (route && touch) {
+        moved = forklessMoveKvobjToArena(kv, header_in_arena, duplicate_payload);
     } else if (touch) {
         moved = forklessMoveKvobjToDefault(kv);
     }
@@ -959,8 +962,12 @@ void forklessFinalizeDbValue(redisDb *db, robj *key, kvobj **kvp,
         }
         kv = moved;
     }
-    forklessMigrateIfNeeded(db, key, &kv, link);
-    forklessRetagLink(link, kv);
+    int migrated = forklessMigrateIfNeeded(db, key, &kv, link);
+    /* Placement above establishes ownership, including header relocation.
+     * Reuse that result instead of asking jemalloc again in RetagLink. The
+     * migration fallback, if taken, always makes the value child-owned.
+     * Do not reuse an old dict tag: a mutation may have changed allocation. */
+    dictSetEntryForkless(link, route && !migrated);
     /* This is a new/post-mutation value. Its old version was captured before
      * the mutation, if needed. Between saves use the last completed round. */
     kvobjSetSnapshot(kv, forkless_round);
@@ -982,6 +989,10 @@ kvobj *forklessFinalizeHashValue(redisDb *db, robj *key, kvobj *kv) {
 
 static int forklessPtrInArena(void *ptr) {
     return forkless_arena_nofork != UINT_MAX &&
+           /* Extents are registered before allocation returns. Outside the
+            * window is definitely not ours; inside may be an unrelated arena
+            * or reused address, and still requires the exact lookup. */
+           zmallocMayBeNoFork(ptr) &&
            zmallocPtrArenaIndex(ptr) == (int)forkless_arena_nofork;
 }
 
